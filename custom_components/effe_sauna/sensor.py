@@ -8,7 +8,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from . import DOMAIN, SaunaCoordinator
+from . import DOMAIN, NO_DATA_THRESHOLD, SaunaCoordinator
 
 
 async def async_setup_entry(
@@ -50,7 +50,7 @@ class SaunaTemperatureSensor(CoordinatorEntity[SaunaCoordinator], SensorEntity):
 
     @property
     def available(self) -> bool:
-        return self.coordinator.data.available and self._last_value is not None
+        return self._last_value is not None and self.coordinator.no_data_streak < NO_DATA_THRESHOLD
 
 
 class SaunaHeaterTempSensor(CoordinatorEntity[SaunaCoordinator], SensorEntity):
@@ -81,7 +81,7 @@ class SaunaHeaterTempSensor(CoordinatorEntity[SaunaCoordinator], SensorEntity):
 
     @property
     def available(self) -> bool:
-        return self.coordinator.data.available and self._last_value is not None
+        return self._last_value is not None and self.coordinator.no_data_streak < NO_DATA_THRESHOLD
 
 
 class SaunaSetpointSensor(CoordinatorEntity[SaunaCoordinator], SensorEntity):
@@ -112,4 +112,4 @@ class SaunaSetpointSensor(CoordinatorEntity[SaunaCoordinator], SensorEntity):
 
     @property
     def available(self) -> bool:
-        return self.coordinator.data.available and self._last_value is not None
+        return self._last_value is not None and self.coordinator.no_data_streak < NO_DATA_THRESHOLD

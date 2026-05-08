@@ -27,6 +27,12 @@ CMD_LIGHT_OFF = bytes.fromhex("f77d0036fdfcfbac")
 DEFAULT_PORT = 8899
 SCAN_INTERVAL = timedelta(seconds=30)
 
+# Number of consecutive failed polls before reporting the sauna as off/unavailable.
+# The Effe app holds an exclusive TCP connection while in use, causing HA polls to fail
+# with OSError (ConnectionRefused). A streak threshold avoids false OFF states during
+# brief app interactions.
+NO_DATA_THRESHOLD = 3  # ~90 seconds
+
 
 @dataclass
 class SaunaData:
@@ -59,6 +65,7 @@ class SaunaCoordinator(DataUpdateCoordinator[SaunaData]):
         self.port = port
         self._light_on = False  # tracked locally (not readable from status packet)
         self._sauna_commanded_on: bool | None = None  # None=unknown, True/False=last sent command
+        self.no_data_streak: int = 0  # consecutive polls with no usable temperature data
 
     async def _async_update_data(self) -> SaunaData:
         try:
@@ -66,8 +73,13 @@ class SaunaCoordinator(DataUpdateCoordinator[SaunaData]):
                 self.hass.async_add_executor_job(self._query_status),
                 timeout=6,
             )
+            if data.available and data.temperature is not None:
+                self.no_data_streak = 0
+            else:
+                self.no_data_streak += 1
             return data
         except Exception as err:
+            self.no_data_streak += 1
             raise UpdateFailed(f"Communication error: {err}") from err
 
     def _query_status(self) -> SaunaData:
