@@ -63,7 +63,7 @@ class SaunaCoordinator(DataUpdateCoordinator[SaunaData]):
         super().__init__(hass, _LOGGER, name=DOMAIN, update_interval=SCAN_INTERVAL)
         self.host = host
         self.port = port
-        self._light_on = False  # tracked locally (not readable from status packet)
+        self._light_on = False  # optimistic local state; overwritten by protocol on each poll
         self._sauna_commanded_on: bool | None = None  # None=unknown, True/False=last sent command
         self.no_data_streak: int = 0  # consecutive polls with no usable temperature data
 
@@ -75,6 +75,7 @@ class SaunaCoordinator(DataUpdateCoordinator[SaunaData]):
             )
             if data.available and data.temperature is not None:
                 self.no_data_streak = 0
+                self._light_on = data.light_on  # sync from protocol
             else:
                 self.no_data_streak += 1
             return data
@@ -100,7 +101,7 @@ class SaunaCoordinator(DataUpdateCoordinator[SaunaData]):
             _LOGGER.debug("status raw(%d): %s", len(raw), raw.hex())
 
             if len(raw) < 41:
-                return SaunaData(available=True)
+                return SaunaData(available=True, light_on=self._light_on)
 
             # Byte 9: internal probe ÷2 (32°C=standby, ~97°C=active)
             temp = raw[9] / 2.0
@@ -108,22 +109,22 @@ class SaunaCoordinator(DataUpdateCoordinator[SaunaData]):
             heater_temp = raw[11] / 2.0 if len(raw) > 11 else None
             # Byte 20: setpoint set via knob ÷2 (stable, ~99.5°C)
             setpoint = raw[20] / 2.0 if len(raw) > 20 else None
-
-            # _light_on: tracked locally (not readable from status packet)
+            # Byte 26 bit 3: light relay — 0xc8=ON, 0xc4=OFF (confirmed by traffic analysis)
+            light_on = bool(raw[26] & 0x08)
 
             return SaunaData(
                 available=True,
                 temperature=temp,
                 heater_temp=heater_temp,
                 setpoint=setpoint,
-                light_on=self._light_on,
+                light_on=light_on,
             )
 
         except ConnectionResetError:
-            # Device resets connections when OFF
-            return SaunaData(available=True)
+            # Device resets connections when busy (Effe app or panel interaction)
+            return SaunaData(available=True, light_on=self._light_on)
         except OSError:
-            return SaunaData(available=False)
+            return SaunaData(available=False, light_on=self._light_on)
 
     async def async_send_command(self, cmd: bytes) -> bool:
         if cmd == CMD_ON:
@@ -140,7 +141,7 @@ class SaunaCoordinator(DataUpdateCoordinator[SaunaData]):
                 self.hass.async_add_executor_job(self._send_cmd, cmd),
                 timeout=5,
             )
-            # Push light_on state to all entities immediately (without re-polling the device)
+            # Optimistic push so UI updates immediately before next poll
             if self.data is not None:
                 self.async_set_updated_data(
                     dataclass_replace(self.data, light_on=self._light_on)
