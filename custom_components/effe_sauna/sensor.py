@@ -6,6 +6,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import UnitOfTemperature
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import DOMAIN, NO_DATA_THRESHOLD, SaunaCoordinator
@@ -22,7 +23,7 @@ async def async_setup_entry(
     ])
 
 
-class SaunaTemperatureSensor(CoordinatorEntity[SaunaCoordinator], SensorEntity):
+class SaunaTemperatureSensor(CoordinatorEntity[SaunaCoordinator], SensorEntity, RestoreEntity):
     _attr_device_class = SensorDeviceClass.TEMPERATURE
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
@@ -41,6 +42,15 @@ class SaunaTemperatureSensor(CoordinatorEntity[SaunaCoordinator], SensorEntity):
         }
         self._last_value: float | None = None
 
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        last_state = await self.async_get_last_state()
+        if last_state is not None and last_state.state not in ("unavailable", "unknown"):
+            try:
+                self._last_value = float(last_state.state)
+            except (ValueError, TypeError):
+                pass
+
     @property
     def native_value(self) -> float | None:
         v = self.coordinator.data.temperature
@@ -53,7 +63,7 @@ class SaunaTemperatureSensor(CoordinatorEntity[SaunaCoordinator], SensorEntity):
         return self._last_value is not None and self.coordinator.no_data_streak < NO_DATA_THRESHOLD
 
 
-class SaunaHeaterTempSensor(CoordinatorEntity[SaunaCoordinator], SensorEntity):
+class SaunaHeaterTempSensor(CoordinatorEntity[SaunaCoordinator], SensorEntity, RestoreEntity):
     _attr_device_class = SensorDeviceClass.TEMPERATURE
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
@@ -72,6 +82,15 @@ class SaunaHeaterTempSensor(CoordinatorEntity[SaunaCoordinator], SensorEntity):
         }
         self._last_value: float | None = None
 
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        last_state = await self.async_get_last_state()
+        if last_state is not None and last_state.state not in ("unavailable", "unknown"):
+            try:
+                self._last_value = float(last_state.state)
+            except (ValueError, TypeError):
+                pass
+
     @property
     def native_value(self) -> float | None:
         v = self.coordinator.data.heater_temp
@@ -84,7 +103,7 @@ class SaunaHeaterTempSensor(CoordinatorEntity[SaunaCoordinator], SensorEntity):
         return self._last_value is not None and self.coordinator.no_data_streak < NO_DATA_THRESHOLD
 
 
-class SaunaSetpointSensor(CoordinatorEntity[SaunaCoordinator], SensorEntity):
+class SaunaSetpointSensor(CoordinatorEntity[SaunaCoordinator], SensorEntity, RestoreEntity):
     _attr_device_class = SensorDeviceClass.TEMPERATURE
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
@@ -102,6 +121,15 @@ class SaunaSetpointSensor(CoordinatorEntity[SaunaCoordinator], SensorEntity):
             "model": "ECC",
         }
         self._last_value: float | None = None
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        last_state = await self.async_get_last_state()
+        if last_state is not None and last_state.state not in ("unavailable", "unknown"):
+            try:
+                self._last_value = float(last_state.state)
+            except (ValueError, TypeError):
+                pass
 
     @property
     def native_value(self) -> float | None:
