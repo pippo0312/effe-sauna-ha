@@ -31,7 +31,7 @@ SCAN_INTERVAL = timedelta(seconds=30)
 # The Effe app holds an exclusive TCP connection while in use, causing HA polls to fail
 # with OSError (ConnectionRefused). A streak threshold avoids false OFF states during
 # brief app interactions.
-NO_DATA_THRESHOLD = 3  # ~90 seconds
+NO_DATA_THRESHOLD = 8  # ~240 seconds (device drops TCP for 2+ min after Effe app commands)
 
 
 @dataclass
