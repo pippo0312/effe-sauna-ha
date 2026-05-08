@@ -1,9 +1,4 @@
-"""Effe ECC Sauna — Home Assistant integration.
-
-Unofficial integration for Effe saunas equipped with the ECC WiFi module,
-compatible with the Effe ECC Android app. Protocol reverse-engineered from
-app traffic; no official API or documentation available.
-"""
+"""Effe ECC Sauna integration."""
 from __future__ import annotations
 
 import asyncio
@@ -22,7 +17,7 @@ _LOGGER = logging.getLogger(__name__)
 DOMAIN = "effe_sauna"
 PLATFORMS = [Platform.SWITCH, Platform.SENSOR]
 
-# TCP commands captured from Effe ECC Android app traffic
+# TCP commands (captured from real app traffic)
 CMD_STATUS    = bytes.fromhex("f77d0028fba5")
 CMD_ON        = bytes.fromhex("f77d0037fdfefefbaf")
 CMD_OFF       = bytes.fromhex("f77d0036fdfefefbae")
@@ -36,9 +31,9 @@ SCAN_INTERVAL = timedelta(seconds=30)
 @dataclass
 class SaunaData:
     available: bool
-    temperature: float | None = None   # byte[9]÷2: device internal probe (32°C=standby, ~97°C=active)
-    heater_temp: float | None = None   # byte[11]÷2: heating element / stones temperature
-    setpoint: float | None = None      # byte[20]÷2: target temperature set via physical dial
+    temperature: float | None = None   # byte[9]÷2: internal probe (32°C=standby, 97°C=active)
+    heater_temp: float | None = None   # byte[11]÷2: heater/stones temperature
+    setpoint: float | None = None      # byte[20]÷2: setpoint set via knob
     heating: bool = False
     light_on: bool = False
 
@@ -62,8 +57,8 @@ class SaunaCoordinator(DataUpdateCoordinator[SaunaData]):
         super().__init__(hass, _LOGGER, name=DOMAIN, update_interval=SCAN_INTERVAL)
         self.host = host
         self.port = port
-        self._light_on = False                       # tracked locally (not readable from protocol)
-        self._sauna_commanded_on: bool | None = None # None=unknown, True/False=last command sent
+        self._light_on = False  # tracked locally (not readable from status packet)
+        self._sauna_commanded_on: bool | None = None  # None=unknown, True/False=last sent command
 
     async def _async_update_data(self) -> SaunaData:
         try:
@@ -73,7 +68,7 @@ class SaunaCoordinator(DataUpdateCoordinator[SaunaData]):
             )
             return data
         except Exception as err:
-            raise UpdateFailed(f"Sauna communication error: {err}") from err
+            raise UpdateFailed(f"Communication error: {err}") from err
 
     def _query_status(self) -> SaunaData:
         try:
@@ -95,19 +90,15 @@ class SaunaCoordinator(DataUpdateCoordinator[SaunaData]):
             if len(raw) < 41:
                 return SaunaData(available=True)
 
-            # Byte 9: device internal probe ÷2°C
-            # IMPORTANT: this probe is physically located near the heating element, NOT in the cabin.
-            # It reads ambient electronics temperature (~32°C) for the first 20–30 min after power-on,
-            # then jumps abruptly to ~97°C once the element heats the probe. It is NOT cabin air temp.
+            # Byte 9: internal probe ÷2 (32°C=standby, ~97°C=active)
             temp = raw[9] / 2.0
-
-            # Byte 11: heating element / stones temperature ÷2°C (slow variation, 96–99°C when active)
+            # Byte 11: heater/stones temperature ÷2, rises slowly 96-99°C
             heater_temp = raw[11] / 2.0 if len(raw) > 11 else None
-
-            # Byte 20: target temperature set via physical dial ÷2°C (stable, typically ~99.5°C)
+            # Byte 20: setpoint set via knob ÷2 (stable, ~99.5°C)
             setpoint = raw[20] / 2.0 if len(raw) > 20 else None
 
-            # _light_on is managed locally — it cannot be read from the protocol response
+            # _light_on: tracked locally (not readable from status packet)
+
             return SaunaData(
                 available=True,
                 temperature=temp,
@@ -117,7 +108,7 @@ class SaunaCoordinator(DataUpdateCoordinator[SaunaData]):
             )
 
         except ConnectionResetError:
-            # Device resets TCP connections when fully powered off — normal behaviour
+            # Device resets connections when OFF
             return SaunaData(available=True)
         except OSError:
             return SaunaData(available=False)
@@ -127,7 +118,7 @@ class SaunaCoordinator(DataUpdateCoordinator[SaunaData]):
             self._sauna_commanded_on = True
         elif cmd == CMD_OFF:
             self._sauna_commanded_on = False
-            self._light_on = False  # hardware turns off the light together with the sauna
+            self._light_on = False   # hardware turns off the light together with the sauna
         elif cmd == CMD_LIGHT_ON:
             self._light_on = True
         elif cmd == CMD_LIGHT_OFF:
@@ -137,7 +128,7 @@ class SaunaCoordinator(DataUpdateCoordinator[SaunaData]):
                 self.hass.async_add_executor_job(self._send_cmd, cmd),
                 timeout=5,
             )
-            # Immediately propagate light_on state to all entities (without re-polling the device)
+            # Push light_on state to all entities immediately (without re-polling the device)
             if self.data is not None:
                 self.async_set_updated_data(
                     dataclass_replace(self.data, light_on=self._light_on)
@@ -154,4 +145,4 @@ class SaunaCoordinator(DataUpdateCoordinator[SaunaData]):
             try:
                 s.recv(64)  # consume ack if any
             except (socket.timeout, ConnectionResetError):
-                pass  # RST = command processed, timeout = no ack: both are expected and OK
+                pass  # RST = command processed, timeout = no ack: both are OK

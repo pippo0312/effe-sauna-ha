@@ -36,7 +36,7 @@ class SaunaPowerSwitch(CoordinatorEntity[SaunaCoordinator], SwitchEntity, Restor
             "model": "ECC",
         }
         self._is_on = False
-        self._no_temp_count = 0  # poll consecutivi senza temperature (ConnectionReset o parziale)
+        self._no_temp_count = 0  # consecutive polls with no temperature data (ConnectionReset or partial)
 
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
@@ -48,24 +48,24 @@ class SaunaPowerSwitch(CoordinatorEntity[SaunaCoordinator], SwitchEntity, Restor
     def _handle_coordinator_update(self) -> None:
         data = self.coordinator.data
         if not data.available:
-            # OSError: device irraggiungibile → OFF certo
+            # OSError: device unreachable → definitely OFF
             self._is_on = False
             self._no_temp_count = 0
             self.coordinator._sauna_commanded_on = False
         elif data.temperature is None:
-            # ConnectionReset o risposta parziale: potrebbe essere transitorio
-            # (il device chiude le connessioni brevemente dopo comandi luce/accensione)
+            # ConnectionReset or partial response: may be transient
+            # (device briefly drops connections after light/power commands)
             self._no_temp_count += 1
             if self._no_temp_count >= 2:
-                # 2 poll consecutivi senza dati (~60s) → sauna effettivamente spenta
+                # 2 consecutive polls with no data (~60s) → sauna is actually off
                 self._is_on = False
                 self.coordinator._sauna_commanded_on = False
         else:
             self._no_temp_count = 0
             if data.temperature > 40.0 or (data.heater_temp is not None and data.heater_temp > 35.0):
-                # Probe >40°C oppure heater >35°C → sicuramente ON
+                # Probe >40°C or heater >35°C → definitely ON (ambient is ~20-25°C)
                 self._is_on = True
-        # zone ambigua (0-40°C) → mantieni stato locale
+        # ambiguous range (0-40°C) → keep local state
         super()._handle_coordinator_update()
 
     @property
@@ -127,8 +127,8 @@ class SaunaLightSwitch(CoordinatorEntity[SaunaCoordinator], SwitchEntity, Restor
     @callback
     def _handle_coordinator_update(self) -> None:
         data = self.coordinator.data
-        # Sincronizza con lo stato tracciato nel coordinator
-        # (viene forzato a False quando la sauna viene spenta)
+        # Sync with locally tracked state in the coordinator
+        # (forced to False when the sauna is powered off)
         if not data.available:
             self._is_on = False
         else:
