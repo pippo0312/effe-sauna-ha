@@ -1,21 +1,4 @@
-"""Effe ECC Sauna — sensor entities.
-
-Temperature sensors in this integration reflect values from the device's internal
-probes, which are NOT suitable for measuring actual cabin temperature:
-
-- Probe Temperature (byte[9]): near the heating element. Reads ~32°C (ambient
-  electronics) for the first 20–30 min, then jumps abruptly to ~97°C. Useful to
-  detect whether the element has reached operating temperature.
-
-- Heater Temperature (byte[11]): heating element / stones probe. Stable around
-  96–99°C when the sauna is active.
-
-- Setpoint (byte[20]): the target temperature set via the physical dial on the device.
-  Reliable but not independently calibrated.
-
-For actual cabin air temperature, use an external sensor placed inside the cabin
-(e.g. a Ruuvi Tag or similar Bluetooth thermometer).
-"""
+"""Effe ECC Sauna — sensor entities."""
 from __future__ import annotations
 
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity, SensorStateClass
@@ -40,18 +23,11 @@ async def async_setup_entry(
 
 
 class SaunaTemperatureSensor(CoordinatorEntity[SaunaCoordinator], SensorEntity):
-    """Device internal probe near the heating element.
-
-    Reads ambient electronics temperature (~32°C) for the first 20–30 min after
-    power-on, then jumps to ~97°C once the element heats the probe physically.
-    This is NOT cabin air temperature.
-    """
-
     _attr_device_class = SensorDeviceClass.TEMPERATURE
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
     _attr_has_entity_name = True
-    _attr_name = "Probe Temperature"
+    _attr_name = "Temperatura Sauna"
     _attr_icon = "mdi:thermometer"
 
     def __init__(self, coordinator: SaunaCoordinator, entry: ConfigEntry) -> None:
@@ -63,28 +39,26 @@ class SaunaTemperatureSensor(CoordinatorEntity[SaunaCoordinator], SensorEntity):
             "manufacturer": "Effe Perfect Wellness",
             "model": "ECC",
         }
+        self._last_value: float | None = None
 
     @property
     def native_value(self) -> float | None:
-        return self.coordinator.data.temperature
+        v = self.coordinator.data.temperature
+        if v is not None:
+            self._last_value = v
+        return self._last_value
 
     @property
     def available(self) -> bool:
-        return self.coordinator.data.available and self.coordinator.data.temperature is not None
+        return self.coordinator.data.available and self._last_value is not None
 
 
 class SaunaHeaterTempSensor(CoordinatorEntity[SaunaCoordinator], SensorEntity):
-    """Heating element / stones temperature probe.
-
-    Slow-changing sensor, typically 96–99°C when the sauna is active.
-    Not calibrated; intended as a relative indicator only.
-    """
-
     _attr_device_class = SensorDeviceClass.TEMPERATURE
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
     _attr_has_entity_name = True
-    _attr_name = "Heater Temperature"
+    _attr_name = "Temperatura Resistenza Sauna"
     _attr_icon = "mdi:thermometer-high"
 
     def __init__(self, coordinator: SaunaCoordinator, entry: ConfigEntry) -> None:
@@ -96,28 +70,26 @@ class SaunaHeaterTempSensor(CoordinatorEntity[SaunaCoordinator], SensorEntity):
             "manufacturer": "Effe Perfect Wellness",
             "model": "ECC",
         }
+        self._last_value: float | None = None
 
     @property
     def native_value(self) -> float | None:
-        return self.coordinator.data.heater_temp
+        v = self.coordinator.data.heater_temp
+        if v is not None:
+            self._last_value = v
+        return self._last_value
 
     @property
     def available(self) -> bool:
-        return self.coordinator.data.available and self.coordinator.data.heater_temp is not None
+        return self.coordinator.data.available and self._last_value is not None
 
 
 class SaunaSetpointSensor(CoordinatorEntity[SaunaCoordinator], SensorEntity):
-    """Target temperature set via the physical dial on the device.
-
-    This value is stable and reflects the dial position. It is not independently
-    calibrated but is reliably read from the protocol (byte[20] ÷ 2°C).
-    """
-
     _attr_device_class = SensorDeviceClass.TEMPERATURE
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
     _attr_has_entity_name = True
-    _attr_name = "Setpoint"
+    _attr_name = "Temperatura Impostata Sauna"
     _attr_icon = "mdi:thermometer-chevron-up"
 
     def __init__(self, coordinator: SaunaCoordinator, entry: ConfigEntry) -> None:
@@ -129,11 +101,15 @@ class SaunaSetpointSensor(CoordinatorEntity[SaunaCoordinator], SensorEntity):
             "manufacturer": "Effe Perfect Wellness",
             "model": "ECC",
         }
+        self._last_value: float | None = None
 
     @property
     def native_value(self) -> float | None:
-        return self.coordinator.data.setpoint
+        v = self.coordinator.data.setpoint
+        if v is not None:
+            self._last_value = v
+        return self._last_value
 
     @property
     def available(self) -> bool:
-        return self.coordinator.data.available and self.coordinator.data.setpoint is not None
+        return self.coordinator.data.available and self._last_value is not None

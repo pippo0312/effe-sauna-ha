@@ -36,6 +36,7 @@ class SaunaPowerSwitch(CoordinatorEntity[SaunaCoordinator], SwitchEntity, Restor
             "model": "ECC",
         }
         self._is_on = False
+        self._no_temp_count = 0  # poll consecutivi senza temperature (ConnectionReset o parziale)
 
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
@@ -46,14 +47,25 @@ class SaunaPowerSwitch(CoordinatorEntity[SaunaCoordinator], SwitchEntity, Restor
     @callback
     def _handle_coordinator_update(self) -> None:
         data = self.coordinator.data
-        if not data.available or data.temperature is None:
-            # Device completamente spento (no TCP response)
+        if not data.available:
+            # OSError: device irraggiungibile → OFF certo
             self._is_on = False
+            self._no_temp_count = 0
             self.coordinator._sauna_commanded_on = False
-        elif data.temperature > 40.0 or (data.heater_temp is not None and data.heater_temp > 35.0):
-            # Probe >40°C oppure heater >35°C → sicuramente ON (heater a temp ambiente è ~20-25°C)
-            self._is_on = True
-        # zone ambigua → mantieni stato locale
+        elif data.temperature is None:
+            # ConnectionReset o risposta parziale: potrebbe essere transitorio
+            # (il device chiude le connessioni brevemente dopo comandi luce/accensione)
+            self._no_temp_count += 1
+            if self._no_temp_count >= 2:
+                # 2 poll consecutivi senza dati (~60s) → sauna effettivamente spenta
+                self._is_on = False
+                self.coordinator._sauna_commanded_on = False
+        else:
+            self._no_temp_count = 0
+            if data.temperature > 40.0 or (data.heater_temp is not None and data.heater_temp > 35.0):
+                # Probe >40°C oppure heater >35°C → sicuramente ON
+                self._is_on = True
+        # zone ambigua (0-40°C) → mantieni stato locale
         super()._handle_coordinator_update()
 
     @property
