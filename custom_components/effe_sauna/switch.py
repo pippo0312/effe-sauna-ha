@@ -47,13 +47,13 @@ class SaunaPowerSwitch(CoordinatorEntity[SaunaCoordinator], SwitchEntity, Restor
     def _handle_coordinator_update(self) -> None:
         data = self.coordinator.data
         if not data.available or data.temperature is None:
-            # Device completely unreachable — treat as off
+            # Device completamente spento (no TCP response)
             self._is_on = False
             self.coordinator._sauna_commanded_on = False
-        elif data.temperature > 40.0:
-            # Temperature clearly above standby → sauna is definitely ON
+        elif data.temperature > 40.0 or (data.heater_temp is not None and data.heater_temp > 35.0):
+            # Probe >40°C oppure heater >35°C → sicuramente ON (heater a temp ambiente è ~20-25°C)
             self._is_on = True
-        # 0–40°C: standby or warming up → keep local optimistic state
+        # zone ambigua → mantieni stato locale
         super()._handle_coordinator_update()
 
     @property
@@ -68,7 +68,7 @@ class SaunaPowerSwitch(CoordinatorEntity[SaunaCoordinator], SwitchEntity, Restor
     def extra_state_attributes(self) -> dict:
         d = self.coordinator.data
         if d.temperature is not None:
-            return {"probe_temperature": f"{d.temperature:.1f}°C"}
+            return {"temperatura": f"{d.temperature:.1f}°C"}
         return {}
 
     async def async_turn_on(self, **kwargs) -> None:
@@ -85,7 +85,7 @@ class SaunaPowerSwitch(CoordinatorEntity[SaunaCoordinator], SwitchEntity, Restor
 class SaunaLightSwitch(CoordinatorEntity[SaunaCoordinator], SwitchEntity, RestoreEntity):
     _attr_icon = "mdi:lightbulb"
     _attr_has_entity_name = True
-    _attr_name = "Sauna Light"
+    _attr_name = "Luce Sauna"
 
     def __init__(self, coordinator: SaunaCoordinator, entry: ConfigEntry) -> None:
         super().__init__(coordinator)
@@ -115,9 +115,8 @@ class SaunaLightSwitch(CoordinatorEntity[SaunaCoordinator], SwitchEntity, Restor
     @callback
     def _handle_coordinator_update(self) -> None:
         data = self.coordinator.data
-        # Sync with the light state tracked in the coordinator.
-        # Forced to False when sauna is turned off (hardware cuts the light).
-        # Can be toggled independently at any sauna temperature.
+        # Sincronizza con lo stato tracciato nel coordinator
+        # (viene forzato a False quando la sauna viene spenta)
         if not data.available:
             self._is_on = False
         else:
