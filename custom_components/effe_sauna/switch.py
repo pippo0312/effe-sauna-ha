@@ -8,7 +8,16 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from . import CMD_LIGHT_OFF, CMD_LIGHT_ON, CMD_OFF, CMD_ON, DOMAIN, NO_DATA_THRESHOLD, SaunaCoordinator
+from . import (
+    CMD_LIGHT_OFF,
+    CMD_LIGHT_ON,
+    CMD_OFF,
+    CMD_ON,
+    DOMAIN,
+    NO_DATA_THRESHOLD,
+    RST_OFF_THRESHOLD,
+    SaunaCoordinator,
+)
 
 
 async def async_setup_entry(
@@ -47,16 +56,28 @@ class SaunaPowerSwitch(CoordinatorEntity[SaunaCoordinator], SwitchEntity, Restor
     def _handle_coordinator_update(self) -> None:
         data = self.coordinator.data
         streak = self.coordinator.no_data_streak
-        if streak >= NO_DATA_THRESHOLD:
-            # Sustained polling failure (device truly off or unreachable)
+        if data.temperature is not None:
+            # Firmware reports probe = 32.0°C exactly as a "standby" code
+            # whenever the master power is OFF. Any other probe value means
+            # the device is actively running (heating or warming up).
+            if data.temperature == 32.0:
+                self._is_on = False
+                self.coordinator._sauna_commanded_on = False
+                self.coordinator._light_on = False
+            else:
+                self._is_on = True
+        elif data.available and streak >= RST_OFF_THRESHOLD:
+            # Device reachable but refusing connections (RST) for several polls
+            # → master power is off. Hardware turns off the light along with master.
             self._is_on = False
             self.coordinator._sauna_commanded_on = False
-        elif data.temperature is not None:
-            if data.temperature > 40.0 or (data.heater_temp is not None and data.heater_temp > 35.0):
-                # Probe >40°C or heater >35°C → definitely ON (ambient is ~20-25°C)
-                self._is_on = True
-            # ambiguous range (0-40°C) → keep local state
-        # streak < threshold and no temperature → transient glitch, keep local state
+            self.coordinator._light_on = False
+        elif not data.available and streak >= NO_DATA_THRESHOLD:
+            # Sustained unreachable (~600 s) = power loss or extended Effe app lockout.
+            self._is_on = False
+            self.coordinator._sauna_commanded_on = False
+            self.coordinator._light_on = False
+        # else: brief glitch — keep last known state
         super()._handle_coordinator_update()
 
     @property

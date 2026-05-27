@@ -25,21 +25,26 @@ CMD_LIGHT_ON  = bytes.fromhex("f77d0037fdfcfbad")
 CMD_LIGHT_OFF = bytes.fromhex("f77d0036fdfcfbac")
 
 DEFAULT_PORT = 8899
-SCAN_INTERVAL = timedelta(seconds=30)
+SCAN_INTERVAL = timedelta(seconds=10)
 
-# Number of consecutive failed polls before reporting the sauna as off/unavailable.
-# The Effe app holds an exclusive TCP connection while in use, causing HA polls to fail
-# with OSError (ConnectionRefused). A streak threshold avoids false OFF states during
-# brief app interactions.
-NO_DATA_THRESHOLD = 60  # ~1800 seconds (30 min) — device can hold TCP for 2+ min per panel toggle
+# Consecutive failed polls before declaring OFF when the host is unreachable
+# (OSError). The Effe mobile app holds an exclusive TCP connection while in
+# use, causing HA polls to fail with OSError; the long grace avoids false OFF
+# states. With 10 s interval, 60 polls ≈ 600 s grace.
+NO_DATA_THRESHOLD = 60
+
+# Consecutive polls where the device is reachable but provides no usable data
+# (RST / short response) before declaring OFF. Master power off triggers RST,
+# so a short debounce is enough to ride out transients.
+RST_OFF_THRESHOLD = 3  # ~30 s
 
 
 @dataclass
 class SaunaData:
     available: bool
-    temperature: float | None = None   # byte[9]÷2: internal probe (32°C=standby, 97°C=active)
+    temperature: float | None = None   # byte[9]÷2: probe (32.0°C = firmware standby code, master OFF)
     heater_temp: float | None = None   # byte[11]÷2: heater/stones temperature
-    setpoint: float | None = None      # byte[20]÷2: setpoint set via knob
+    setpoint: float | None = None      # (byte[20] & 0xFE)÷2: setpoint via knob
     heating: bool = False
     light_on: bool = False
 
@@ -63,9 +68,9 @@ class SaunaCoordinator(DataUpdateCoordinator[SaunaData]):
         super().__init__(hass, _LOGGER, name=DOMAIN, update_interval=SCAN_INTERVAL)
         self.host = host
         self.port = port
-        self._light_on = False  # optimistic local state; overwritten by protocol on each poll
-        self._sauna_commanded_on: bool | None = None  # None=unknown, True/False=last sent command
-        self.no_data_streak: int = 0  # consecutive polls with no usable temperature data
+        self._light_on = False  # optimistic local; overwritten by protocol on each good poll
+        self._sauna_commanded_on: bool | None = None
+        self.no_data_streak: int = 0
 
     async def _async_update_data(self) -> SaunaData:
         try:
@@ -75,7 +80,6 @@ class SaunaCoordinator(DataUpdateCoordinator[SaunaData]):
             )
             if data.available and data.temperature is not None:
                 self.no_data_streak = 0
-                self._light_on = data.light_on  # sync from protocol
             else:
                 self.no_data_streak += 1
             return data
@@ -103,14 +107,16 @@ class SaunaCoordinator(DataUpdateCoordinator[SaunaData]):
             if len(raw) < 41:
                 return SaunaData(available=True, light_on=self._light_on)
 
-            # Byte 9: internal probe ÷2 (32°C=standby, ~97°C=active)
             temp = raw[9] / 2.0
-            # Byte 11: heater/stones temperature ÷2, rises slowly 96-99°C
             heater_temp = raw[11] / 2.0 if len(raw) > 11 else None
-            # Byte 20: setpoint set via knob ÷2 (stable, ~99.5°C)
-            setpoint = raw[20] / 2.0 if len(raw) > 20 else None
-            # Byte 26 bit 3: light relay — 0xc8=ON, 0xc4=OFF (confirmed by traffic analysis)
-            light_on = bool(raw[26] & 0x08)
+            # byte[20]: bits 1-7 = setpoint × 2, bit 0 = light relay
+            if len(raw) > 20:
+                setpoint = (raw[20] & 0xFE) / 2.0
+                light_on = bool(raw[20] & 0x01)
+                self._light_on = light_on
+            else:
+                setpoint = None
+                light_on = self._light_on
 
             return SaunaData(
                 available=True,
@@ -121,7 +127,7 @@ class SaunaCoordinator(DataUpdateCoordinator[SaunaData]):
             )
 
         except ConnectionResetError:
-            # Device resets connections when busy (Effe app or panel interaction)
+            # Device resets connections when busy (Effe app, panel) or master OFF.
             return SaunaData(available=True, light_on=self._light_on)
         except OSError:
             return SaunaData(available=False, light_on=self._light_on)
@@ -131,7 +137,7 @@ class SaunaCoordinator(DataUpdateCoordinator[SaunaData]):
             self._sauna_commanded_on = True
         elif cmd == CMD_OFF:
             self._sauna_commanded_on = False
-            self._light_on = False   # hardware turns off the light together with the sauna
+            self._light_on = False
         elif cmd == CMD_LIGHT_ON:
             self._light_on = True
         elif cmd == CMD_LIGHT_OFF:
