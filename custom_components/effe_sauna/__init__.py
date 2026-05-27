@@ -68,7 +68,7 @@ class SaunaCoordinator(DataUpdateCoordinator[SaunaData]):
         super().__init__(hass, _LOGGER, name=DOMAIN, update_interval=SCAN_INTERVAL)
         self.host = host
         self.port = port
-        self._light_on = False  # optimistic local; overwritten by protocol on each good poll
+        self._light_on = False  # tracked locally — no reliable light bit in status packet
         self._sauna_commanded_on: bool | None = None
         self.no_data_streak: int = 0
 
@@ -109,21 +109,18 @@ class SaunaCoordinator(DataUpdateCoordinator[SaunaData]):
 
             temp = raw[9] / 2.0
             heater_temp = raw[11] / 2.0 if len(raw) > 11 else None
-            # byte[20]: bits 1-7 = setpoint × 2, bit 0 = light relay
-            if len(raw) > 20:
-                setpoint = (raw[20] & 0xFE) / 2.0
-                light_on = bool(raw[20] & 0x01)
-                self._light_on = light_on
-            else:
-                setpoint = None
-                light_on = self._light_on
+            # byte[20] roughly tracks the setpoint ÷2 but its LSB oscillates
+            # spontaneously every few seconds (likely part of the firmware's
+            # PID/control loop), so it is NOT a reliable light-state bit.
+            # Light state is tracked locally based on commands sent.
+            setpoint = raw[20] / 2.0 if len(raw) > 20 else None
 
             return SaunaData(
                 available=True,
                 temperature=temp,
                 heater_temp=heater_temp,
                 setpoint=setpoint,
-                light_on=light_on,
+                light_on=self._light_on,
             )
 
         except ConnectionResetError:
