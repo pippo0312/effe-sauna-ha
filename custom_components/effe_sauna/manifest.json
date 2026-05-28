@@ -1,11 +1,11 @@
 {
   "domain": "effe_sauna",
   "name": "Effe ECC Sauna",
-  "documentation": "https://github.com/",
+  "documentation": "https://github.com/pippo0312/effe-sauna-ha",
   "dependencies": [],
   "codeowners": [],
   "requirements": [],
-  "version": "1.1.1",
+  "version": "1.2.0",
   "iot_class": "local_polling",
   "config_flow": true
 }

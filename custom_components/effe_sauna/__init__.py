@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import socket
+import time
 from dataclasses import dataclass, replace as dataclass_replace
 from datetime import timedelta
 
@@ -25,28 +26,45 @@ CMD_LIGHT_ON  = bytes.fromhex("f77d0037fdfcfbad")
 CMD_LIGHT_OFF = bytes.fromhex("f77d0036fdfcfbac")
 
 DEFAULT_PORT = 8899
-SCAN_INTERVAL = timedelta(seconds=10)
+SCAN_INTERVAL = timedelta(seconds=5)
 
-# Consecutive failed polls before declaring OFF when the host is unreachable
-# (OSError). The Effe mobile app holds an exclusive TCP connection while in
-# use, causing HA polls to fail with OSError; the long grace avoids false OFF
-# states. With 10 s interval, 60 polls ≈ 600 s grace.
-NO_DATA_THRESHOLD = 60
+# Consecutive failed polls before declaring device unavailable when the host is
+# unreachable (OSError). The Effe mobile app holds an exclusive TCP connection
+# while in use, causing HA polls to fail; the long grace avoids false unavail.
+NO_DATA_THRESHOLD = 120  # ~600 s @ 5 s interval
 
-# Consecutive polls where the device is reachable but provides no usable data
-# (RST / short response) before declaring OFF. Master power off triggers RST,
-# so a short debounce is enough to ride out transients.
-RST_OFF_THRESHOLD = 3  # ~30 s
+# Reverse-engineered byte[9] bitfield (verified 2026-05-28 with master/light
+# toggles, 10 panel toggles confirmed deterministic):
+#   bit 0 (0x01) = master power ON
+#   bit 1 (0x02) = light ON
+#   bit 6 (0x40) = lifesign, set whenever the controller is alive
+#   bits 2-5, 7  = unknown (always 0 in observed states; reserved for future
+#                  reverse-engineering, e.g. heating active, error, etc.)
+BIT_MASTER = 0x01
+BIT_LIGHT  = 0x02
+
+# STATUS frame marker: header f7 00 80 + opcode 0x28 (response to CMD_STATUS).
+# The device sometimes prefixes the response with an unsolicited ack frame
+# (e.g. after a panel button press: f7 00 80 37 ef fb a6 ...). Anchoring on
+# the STATUS marker is mandatory — a fixed raw[9] read picks up garbage from
+# the ack and reports a spurious "all off" state for one polling cycle.
+STATUS_MARKER = b"\xf7\x00\x80\x28"
+STATUS_FRAME_LEN = 41
 
 
 @dataclass
 class SaunaData:
     available: bool
-    temperature: float | None = None   # byte[9]÷2: probe (32.0°C = firmware standby code, master OFF)
-    heater_temp: float | None = None   # byte[11]÷2: heater/stones temperature
-    setpoint: float | None = None      # (byte[20] & 0xFE)÷2: setpoint via knob
-    heating: bool = False
+    master_on: bool = False
     light_on: bool = False
+    # byte[11]: raw sensor value from the controller's internal probe. Not a
+    # linear Celsius reading: ranges roughly 14 (cold, ambient ~22°C) to 200+
+    # (sauna heating). The /2 conversion used by earlier versions of this
+    # integration was incorrect (NTC curve, not linear). Exposed as raw int
+    # for qualitative diagnostics — use an external thermometer (Ruuvi etc.)
+    # for actual cabin temperature.
+    heater_raw: int | None = None
+    setpoint: float | None = None      # (byte[20] & 0xFE)÷2: setpoint via knob
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -68,17 +86,15 @@ class SaunaCoordinator(DataUpdateCoordinator[SaunaData]):
         super().__init__(hass, _LOGGER, name=DOMAIN, update_interval=SCAN_INTERVAL)
         self.host = host
         self.port = port
-        self._light_on = False  # tracked locally — no reliable light bit in status packet
-        self._sauna_commanded_on: bool | None = None
         self.no_data_streak: int = 0
 
     async def _async_update_data(self) -> SaunaData:
         try:
             data = await asyncio.wait_for(
                 self.hass.async_add_executor_job(self._query_status),
-                timeout=6,
+                timeout=4,
             )
-            if data.available and data.temperature is not None:
+            if data.available:
                 self.no_data_streak = 0
             else:
                 self.no_data_streak += 1
@@ -89,9 +105,9 @@ class SaunaCoordinator(DataUpdateCoordinator[SaunaData]):
 
     def _query_status(self) -> SaunaData:
         try:
-            with socket.create_connection((self.host, self.port), timeout=4) as s:
+            with socket.create_connection((self.host, self.port), timeout=3) as s:
                 s.sendall(CMD_STATUS)
-                s.settimeout(2)
+                s.settimeout(1.5)
                 raw = b""
                 try:
                     while True:
@@ -104,61 +120,82 @@ class SaunaCoordinator(DataUpdateCoordinator[SaunaData]):
 
             _LOGGER.debug("status raw(%d): %s", len(raw), raw.hex())
 
-            if len(raw) < 41:
-                return SaunaData(available=True, light_on=self._light_on)
+            # Locate the STATUS frame inside the response; an unsolicited ack
+            # frame may precede it (e.g. after a panel toggle).
+            idx = raw.find(STATUS_MARKER)
+            if idx < 0 or len(raw) < idx + STATUS_FRAME_LEN:
+                # No usable STATUS frame in this response — keep last state.
+                return SaunaData(available=True)
+            frame = raw[idx : idx + STATUS_FRAME_LEN]
 
-            temp = raw[9] / 2.0
-            heater_temp = raw[11] / 2.0 if len(raw) > 11 else None
-            # byte[20] roughly tracks the setpoint ÷2 but its LSB oscillates
-            # spontaneously every few seconds (likely part of the firmware's
-            # PID/control loop), so it is NOT a reliable light-state bit.
-            # Light state is tracked locally based on commands sent.
-            setpoint = raw[20] / 2.0 if len(raw) > 20 else None
+            byte9 = frame[9]
+            master_on = bool(byte9 & BIT_MASTER)
+            light_on  = bool(byte9 & BIT_LIGHT)
+            heater_raw = frame[11]
+            # byte[20] tracks the setpoint ÷2 but its LSB oscillates (firmware
+            # parity bit), so mask it before dividing.
+            setpoint = (frame[20] & 0xFE) / 2.0
 
             return SaunaData(
                 available=True,
-                temperature=temp,
-                heater_temp=heater_temp,
+                master_on=master_on,
+                light_on=light_on,
+                heater_raw=heater_raw,
                 setpoint=setpoint,
-                light_on=self._light_on,
             )
 
         except ConnectionResetError:
-            # Device resets connections when busy (Effe app, panel) or master OFF.
-            return SaunaData(available=True, light_on=self._light_on)
+            # Device resets connections when the Effe app holds the socket.
+            # The device is reachable; state is just temporarily unreadable.
+            return SaunaData(available=True)
         except OSError:
-            return SaunaData(available=False, light_on=self._light_on)
+            return SaunaData(available=False)
 
     async def async_send_command(self, cmd: bytes) -> bool:
-        if cmd == CMD_ON:
-            self._sauna_commanded_on = True
-        elif cmd == CMD_OFF:
-            self._sauna_commanded_on = False
-            self._light_on = False
-        elif cmd == CMD_LIGHT_ON:
-            self._light_on = True
-        elif cmd == CMD_LIGHT_OFF:
-            self._light_on = False
+        # Predict the resulting state and push it optimistically — the next
+        # poll will confirm it from the bitfield within SCAN_INTERVAL.
+        predicted = None
+        if self.data is not None:
+            if cmd == CMD_ON:
+                predicted = dataclass_replace(self.data, master_on=True)
+            elif cmd == CMD_OFF:
+                # Hardware turns off the light together with the master.
+                predicted = dataclass_replace(self.data, master_on=False, light_on=False)
+            elif cmd == CMD_LIGHT_ON:
+                predicted = dataclass_replace(self.data, light_on=True)
+            elif cmd == CMD_LIGHT_OFF:
+                predicted = dataclass_replace(self.data, light_on=False)
+
         try:
             await asyncio.wait_for(
                 self.hass.async_add_executor_job(self._send_cmd, cmd),
-                timeout=5,
+                timeout=8,
             )
-            # Optimistic push so UI updates immediately before next poll
-            if self.data is not None:
-                self.async_set_updated_data(
-                    dataclass_replace(self.data, light_on=self._light_on)
-                )
+            if predicted is not None:
+                self.async_set_updated_data(predicted)
             return True
         except Exception as err:
             _LOGGER.error("Command send error: %s", err)
             return False
 
     def _send_cmd(self, cmd: bytes) -> None:
-        with socket.create_connection((self.host, self.port), timeout=4) as s:
-            s.sendall(cmd)
-            s.settimeout(1)
+        # The device briefly refuses new connections during transitions (e.g.
+        # just after a panel button press, while the internal firmware app
+        # finishes processing). Retry transparently so the user doesn't have
+        # to.
+        last_err: Exception | None = None
+        for attempt in range(4):
             try:
-                s.recv(64)  # consume ack if any
-            except (socket.timeout, ConnectionResetError):
-                pass  # RST = command processed, timeout = no ack: both are OK
+                with socket.create_connection((self.host, self.port), timeout=1.5) as s:
+                    s.sendall(cmd)
+                    s.settimeout(0.7)
+                    try:
+                        s.recv(64)  # consume ack if any
+                    except (socket.timeout, ConnectionResetError):
+                        pass  # RST = command processed, timeout = no ack: both are OK
+                return
+            except OSError as err:
+                last_err = err
+                time.sleep(0.35)
+        if last_err is not None:
+            raise last_err

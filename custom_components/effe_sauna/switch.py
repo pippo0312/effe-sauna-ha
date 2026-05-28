@@ -5,7 +5,6 @@ from homeassistant.components.switch import SwitchEntity
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import (
@@ -15,7 +14,6 @@ from . import (
     CMD_ON,
     DOMAIN,
     NO_DATA_THRESHOLD,
-    RST_OFF_THRESHOLD,
     SaunaCoordinator,
 )
 
@@ -30,7 +28,16 @@ async def async_setup_entry(
     ])
 
 
-class SaunaPowerSwitch(CoordinatorEntity[SaunaCoordinator], SwitchEntity, RestoreEntity):
+def _device_info(entry_id: str) -> dict:
+    return {
+        "identifiers": {(DOMAIN, entry_id)},
+        "name": "Effe ECC Sauna",
+        "manufacturer": "Effe Perfect Wellness",
+        "model": "ECC",
+    }
+
+
+class SaunaPowerSwitch(CoordinatorEntity[SaunaCoordinator], SwitchEntity):
     _attr_icon = "mdi:sauna"
     _attr_has_entity_name = True
     _attr_name = "Sauna"
@@ -38,76 +45,24 @@ class SaunaPowerSwitch(CoordinatorEntity[SaunaCoordinator], SwitchEntity, Restor
     def __init__(self, coordinator: SaunaCoordinator, entry: ConfigEntry) -> None:
         super().__init__(coordinator)
         self._attr_unique_id = f"{entry.entry_id}_power"
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, entry.entry_id)},
-            "name": "Effe ECC Sauna",
-            "manufacturer": "Effe Perfect Wellness",
-            "model": "ECC",
-        }
-        self._is_on = False
-
-    async def async_added_to_hass(self) -> None:
-        await super().async_added_to_hass()
-        last_state = await self.async_get_last_state()
-        if last_state is not None:
-            self._is_on = last_state.state == "on"
-
-    @callback
-    def _handle_coordinator_update(self) -> None:
-        data = self.coordinator.data
-        streak = self.coordinator.no_data_streak
-        if data.temperature is not None:
-            # Firmware reports probe = 32.0°C exactly as a "standby" code
-            # whenever the master power is OFF. Any other probe value means
-            # the device is actively running (heating or warming up).
-            if data.temperature == 32.0:
-                self._is_on = False
-                self.coordinator._sauna_commanded_on = False
-                self.coordinator._light_on = False
-            else:
-                self._is_on = True
-        elif data.available and streak >= RST_OFF_THRESHOLD:
-            # Device reachable but refusing connections (RST) for several polls
-            # → master power is off. Hardware turns off the light along with master.
-            self._is_on = False
-            self.coordinator._sauna_commanded_on = False
-            self.coordinator._light_on = False
-        elif not data.available and streak >= NO_DATA_THRESHOLD:
-            # Sustained unreachable (~600 s) = power loss or extended Effe app lockout.
-            self._is_on = False
-            self.coordinator._sauna_commanded_on = False
-            self.coordinator._light_on = False
-        # else: brief glitch — keep last known state
-        super()._handle_coordinator_update()
+        self._attr_device_info = _device_info(entry.entry_id)
 
     @property
     def is_on(self) -> bool:
-        return self._is_on
+        return self.coordinator.data is not None and self.coordinator.data.master_on
 
     @property
     def available(self) -> bool:
-        # Stay available during transient failures (e.g. Effe app holding the TCP connection)
         return self.coordinator.no_data_streak < NO_DATA_THRESHOLD
 
-    @property
-    def extra_state_attributes(self) -> dict:
-        d = self.coordinator.data
-        if d.temperature is not None:
-            return {"temperatura": f"{d.temperature:.1f}°C"}
-        return {}
-
     async def async_turn_on(self, **kwargs) -> None:
-        self._is_on = True
-        self.async_write_ha_state()
         await self.coordinator.async_send_command(CMD_ON)
 
     async def async_turn_off(self, **kwargs) -> None:
-        self._is_on = False
-        self.async_write_ha_state()
         await self.coordinator.async_send_command(CMD_OFF)
 
 
-class SaunaLightSwitch(CoordinatorEntity[SaunaCoordinator], SwitchEntity, RestoreEntity):
+class SaunaLightSwitch(CoordinatorEntity[SaunaCoordinator], SwitchEntity):
     _attr_icon = "mdi:lightbulb"
     _attr_has_entity_name = True
     _attr_name = "Luce Sauna"
@@ -115,49 +70,18 @@ class SaunaLightSwitch(CoordinatorEntity[SaunaCoordinator], SwitchEntity, Restor
     def __init__(self, coordinator: SaunaCoordinator, entry: ConfigEntry) -> None:
         super().__init__(coordinator)
         self._attr_unique_id = f"{entry.entry_id}_light"
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, entry.entry_id)},
-            "name": "Effe ECC Sauna",
-            "manufacturer": "Effe Perfect Wellness",
-            "model": "ECC",
-        }
-        self._is_on = False
-
-    async def async_added_to_hass(self) -> None:
-        await super().async_added_to_hass()
-        last_state = await self.async_get_last_state()
-        if last_state is not None:
-            self._is_on = last_state.state == "on"
+        self._attr_device_info = _device_info(entry.entry_id)
 
     @property
     def is_on(self) -> bool:
-        return self._is_on
+        return self.coordinator.data is not None and self.coordinator.data.light_on
 
     @property
     def available(self) -> bool:
         return self.coordinator.no_data_streak < NO_DATA_THRESHOLD
 
-    @callback
-    def _handle_coordinator_update(self) -> None:
-        data = self.coordinator.data
-        if self.coordinator.no_data_streak >= NO_DATA_THRESHOLD:
-            self._is_on = False
-        elif data.available:
-            # Sync with locally tracked state in the coordinator
-            # (forced to False when the sauna is powered off)
-            self._is_on = data.light_on
-        super()._handle_coordinator_update()
-
     async def async_turn_on(self, **kwargs) -> None:
-        self._is_on = True
-        self.async_write_ha_state()
-        if not await self.coordinator.async_send_command(CMD_LIGHT_ON):
-            self._is_on = False
-            self.async_write_ha_state()
+        await self.coordinator.async_send_command(CMD_LIGHT_ON)
 
     async def async_turn_off(self, **kwargs) -> None:
-        self._is_on = False
-        self.async_write_ha_state()
-        if not await self.coordinator.async_send_command(CMD_LIGHT_OFF):
-            self._is_on = True
-            self.async_write_ha_state()
+        await self.coordinator.async_send_command(CMD_LIGHT_OFF)
