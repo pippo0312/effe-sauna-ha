@@ -99,18 +99,34 @@ class SaunaCoordinator(DataUpdateCoordinator[SaunaData]):
             else:
                 self.no_data_streak += 1
             return data
+        except asyncio.TimeoutError:
+            # The inner socket work is bounded below this asyncio budget (see
+            # _query_status), so this should not normally fire. If a poll still
+            # overruns (e.g. the Effe app/panel is holding the socket), treat it
+            # as a transient busy device — same policy as ConnectionResetError —
+            # rather than raising UpdateFailed and spamming the log.
+            self.no_data_streak += 1
+            return self.data if self.data is not None else SaunaData(available=True)
         except Exception as err:
             self.no_data_streak += 1
             raise UpdateFailed(f"Communication error: {err}") from err
 
     def _query_status(self) -> SaunaData:
         try:
-            with socket.create_connection((self.host, self.port), timeout=3) as s:
+            # Keep the total socket budget (connect + read) strictly below the
+            # 4 s asyncio.wait_for budget in _async_update_data, so a slow/busy
+            # device produces a caught OSError (available=False) instead of an
+            # asyncio.TimeoutError that escapes and leaks the executor thread.
+            with socket.create_connection((self.host, self.port), timeout=1.5) as s:
                 s.sendall(CMD_STATUS)
-                s.settimeout(1.5)
                 raw = b""
+                deadline = time.monotonic() + 1.5
                 try:
                     while True:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        s.settimeout(remaining)
                         chunk = s.recv(512)
                         if not chunk:
                             break
