@@ -140,7 +140,11 @@ class SaunaCoordinator(DataUpdateCoordinator[SaunaData]):
             # frame may precede it (e.g. after a panel toggle).
             idx = raw.find(STATUS_MARKER)
             if idx < 0 or len(raw) < idx + STATUS_FRAME_LEN:
-                # No usable STATUS frame in this response — keep last state.
+                # No usable STATUS frame in this response (e.g. the reply was
+                # split across TCP reads) — genuinely keep the last known
+                # state instead of reporting spurious all-off/unavailable.
+                if self.data is not None:
+                    return dataclass_replace(self.data, available=True)
                 return SaunaData(available=True)
             frame = raw[idx : idx + STATUS_FRAME_LEN]
 
@@ -162,9 +166,18 @@ class SaunaCoordinator(DataUpdateCoordinator[SaunaData]):
 
         except ConnectionResetError:
             # Device resets connections when the Effe app holds the socket.
-            # The device is reachable; state is just temporarily unreadable.
+            # The device is reachable; state is just temporarily unreadable —
+            # keep the last known state instead of reporting spurious all-off.
+            if self.data is not None:
+                return dataclass_replace(self.data, available=True)
             return SaunaData(available=True)
         except OSError:
+            # Connection/timeout failure. Entities stay available (see
+            # NO_DATA_THRESHOLD in switch.py/sensor.py, which is not driven by
+            # SaunaData.available) so keep the last known state here too,
+            # rather than silently reporting spurious all-off.
+            if self.data is not None:
+                return dataclass_replace(self.data, available=True)
             return SaunaData(available=False)
 
     async def async_send_command(self, cmd: bytes) -> bool:
