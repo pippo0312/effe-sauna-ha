@@ -3,18 +3,52 @@
     "step": {
       "user": {
         "title": "Effe ECC Sauna",
-        "description": "Enter the IP address of your Effe sauna WiFi module (ECC controller). Default port is 8899.",
-        "data": {
-          "host": "IP Address",
-          "port": "TCP Port"
+        "menu_options": {
+          "discover": "Search the sauna on the network",
+          "manual": "Enter the IP address",
+          "wifi": "Connect a sauna to Wi-Fi (first setup or new network/password)"
         }
-      }
+      },
+      "discover": {"title": "Saunas found", "data": {"device": "Sauna"}},
+      "manual": {"title": "Configure Effe ECC Sauna", "data": {"host": "IP address", "port": "TCP port"}},
+      "wifi": {
+        "title": "Connect the sauna to Wi-Fi",
+        "description": "1. On the panel: press CHANGE twice, then hold on/off for 5 s until the REMOTE led blinks (hammam/Logica: hold on/off 5 s until the House icon blinks).\n2. Enter the 2.4 GHz Wi-Fi network and its password.\n3. Home Assistant sends the data for 45 s (EspTouch) and, without an answer, 45 s more (SmartLink). It works best if the router forwards multicast to Wi-Fi.",
+        "data": {"ssid": "Network name (SSID)", "password": "Password", "bssid": "Access point BSSID (optional)", "method": "Method"},
+        "data_description": {"bssid": "MAC of the 2.4 GHz radio of the access point nearest to the sauna, e.g. AA:BB:CC:DD:EE:FF. Empty = 00:00:00:00:00:00."}
+      },
+      "reconfigure": {"title": "Change the sauna address", "data": {"host": "IP address", "port": "TCP port"}}
     },
+    "progress": {"provisioning": "Sending the Wi-Fi network to the sauna (up to 90 seconds)..."},
     "error": {
-      "cannot_connect": "Cannot connect to the sauna. Check the IP address and port, and make sure the device is powered on and reachable on your network."
+      "cannot_connect": "Cannot connect to the sauna. Check IP and port.",
+      "no_devices": "No sauna found on the network: enter the IP address.",
+      "no_answer": "The sauna did not answer. Check that the REMOTE led blinks, that the network is 2.4 GHz and the password; try again."
     },
     "abort": {
-      "already_configured": "This device is already configured."
+      "already_configured": "This sauna is already configured (address updated).",
+      "reconfigure_successful": "Address updated."
     }
+  },
+  "selector": {
+    "method": {"options": {"auto": "Automatic (EspTouch, then SmartLink)", "esptouch": "EspTouch only", "smartlink": "SmartLink only"}}
+  },
+  "services": {
+    "discover": {
+      "name": "Search saunas",
+      "description": "Search Effe ECC modules on the network (UDP 48899) and return IP, MAC, serial and firmware.",
+      "fields": {"hosts": {"name": "Addresses to query", "description": "IPs to query directly too, if the router blocks broadcasts."}}
+    },
+    "wifi_setup": {
+      "name": "Connect the sauna to Wi-Fi",
+      "description": "Send network and password to the Wi-Fi module in configuration mode (REMOTE led blinking). For the first setup or to change network or password.",
+      "fields": {
+        "ssid": {"name": "SSID", "description": "2.4 GHz network name."},
+        "password": {"name": "Password", "description": "Network password."},
+        "bssid": {"name": "BSSID", "description": "Access point MAC (optional)."},
+        "method": {"name": "Method", "description": "auto, esptouch or smartlink."}
+      }
+    },
+    "sync_time": {"name": "Sync clock", "description": "Set the Home Assistant time on the sauna."}
   }
 }

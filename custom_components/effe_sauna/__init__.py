@@ -3,53 +3,48 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import socket
-import time
 from dataclasses import dataclass, replace as dataclass_replace
 from datetime import timedelta
 
+import voluptuous as vol
+
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_HOST, CONF_PORT, Platform
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.device_registry import CONNECTION_NETWORK_MAC
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.util import dt as dt_util
+
+from . import protocol as ccp
+from .provisioning import provision
 
 _LOGGER = logging.getLogger(__name__)
 
 DOMAIN = "effe_sauna"
-PLATFORMS = [Platform.SWITCH, Platform.SENSOR]
+PLATFORMS = [Platform.SWITCH, Platform.SENSOR, Platform.BINARY_SENSOR, Platform.BUTTON]
 
-# TCP commands (captured from real app traffic)
-CMD_STATUS    = bytes.fromhex("f77d0028fba5")
-CMD_ON        = bytes.fromhex("f77d0037fdfefefbaf")
-CMD_OFF       = bytes.fromhex("f77d0036fdfefefbae")
-CMD_LIGHT_ON  = bytes.fromhex("f77d0037fdfcfbad")
-CMD_LIGHT_OFF = bytes.fromhex("f77d0036fdfcfbac")
-
-DEFAULT_PORT = 8899
+DEFAULT_PORT = ccp.TCP_PORT
 SCAN_INTERVAL = timedelta(seconds=5)
 
-# Consecutive failed polls before declaring device unavailable when the host is
-# unreachable (OSError). The Effe mobile app holds an exclusive TCP connection
-# while in use, causing HA polls to fail; the long grace avoids false unavail.
+# Kept for backwards compatibility (v1.2.x imports).
+CMD_STATUS = ccp.build_frame(ccp.CMD_GET_STATE)
+CMD_ON = ccp.build_frame(ccp.CMD_ON, bytes((ccp.TARGET_SAUNA, ccp.FUNC_SAUNA)))
+CMD_OFF = ccp.build_frame(ccp.CMD_OFF, bytes((ccp.TARGET_SAUNA, ccp.FUNC_SAUNA)))
+CMD_LIGHT_ON = ccp.build_frame(ccp.CMD_ON, bytes((ccp.TARGET_SAUNA, ccp.FUNC_LIGHT)))
+CMD_LIGHT_OFF = ccp.build_frame(ccp.CMD_OFF, bytes((ccp.TARGET_SAUNA, ccp.FUNC_LIGHT)))
+
+# Consecutive failed polls before declaring the device unavailable. The Effe
+# app holds an exclusive TCP connection while in use, so HA polls fail; the
+# long grace avoids false "unavailable".
 NO_DATA_THRESHOLD = 120  # ~600 s @ 5 s interval
 
-# Reverse-engineered byte[9] bitfield (verified 2026-05-28 with master/light
-# toggles, 10 panel toggles confirmed deterministic):
-#   bit 0 (0x01) = master power ON
-#   bit 1 (0x02) = light ON
-#   bit 6 (0x40) = lifesign, set whenever the controller is alive
-#   bits 2-5, 7  = unknown (always 0 in observed states; reserved for future
-#                  reverse-engineering, e.g. heating active, error, etc.)
-BIT_MASTER = 0x01
-BIT_LIGHT  = 0x02
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
-# STATUS frame marker: header f7 00 80 + opcode 0x28 (response to CMD_STATUS).
-# The device sometimes prefixes the response with an unsolicited ack frame
-# (e.g. after a panel button press: f7 00 80 37 ef fb a6 ...). Anchoring on
-# the STATUS marker is mandatory — a fixed raw[9] read picks up garbage from
-# the ack and reports a spurious "all off" state for one polling cycle.
-STATUS_MARKER = b"\xf7\x00\x80\x28"
-STATUS_FRAME_LEN = 41
+SERVICE_SYNC_TIME = "sync_time"
+SERVICE_WIFI_SETUP = "wifi_setup"
+SERVICE_DISCOVER = "discover"
 
 
 @dataclass
@@ -57,19 +52,122 @@ class SaunaData:
     available: bool
     master_on: bool = False
     light_on: bool = False
-    # byte[11]: raw sensor value from the controller's internal probe. Not a
-    # linear Celsius reading: ranges roughly 14 (cold, ambient ~22°C) to 200+
-    # (sauna heating). The /2 conversion used by earlier versions of this
-    # integration was incorrect (NTC curve, not linear). Exposed as raw int
-    # for qualitative diagnostics — use an external thermometer (Ruuvi etc.)
-    # for actual cabin temperature.
+    ready: bool | None = None
+    domotic: bool | None = None
+    panel: bool | None = None
+    sauna_flags: int | None = None
+    # DATA[7] / frame[11]: controller probe, same scale as the setpoint
+    # (2 units per °C). Settles on the setpoint while regulating; not
+    # accurate when cold.
     heater_raw: int | None = None
-    setpoint: float | None = None      # (byte[20] & 0xFE)÷2: setpoint via knob
+    setpoint: float | None = None      # (DATA[16] & 0xFE) / 2
+
+
+@dataclass
+class DeviceInfoData:
+    firmware: str | None = None
+    serial: str | None = None
+    product_code: int | None = None
+    product_name: str | None = None
+    wifi_firmware: str | None = None
+    mac: str | None = None
+
+
+def device_info(coordinator: "SaunaCoordinator") -> dict:
+    info = coordinator.device
+    model = "ECC"
+    if info.product_name:
+        model = f"ECC — {info.product_name} (codice {info.product_code})"
+    dev = {
+        "identifiers": {(DOMAIN, coordinator.entry_id)},
+        "name": "Effe ECC Sauna",
+        "manufacturer": "Effe Perfect Wellness",
+        "model": model,
+    }
+    if info.firmware:
+        dev["sw_version"] = info.firmware
+    if info.wifi_firmware:
+        dev["hw_version"] = f"Wi-Fi {info.wifi_firmware}"
+    if info.serial:
+        dev["serial_number"] = info.serial
+    if info.mac:
+        dev["connections"] = {(CONNECTION_NETWORK_MAC, info.mac.lower())}
+    return dev
+
+
+async def async_setup(hass: HomeAssistant, config: dict) -> bool:
+    async def _discover(call: ServiceCall):
+        hosts = call.data.get("hosts") or []
+        devs = await hass.async_add_executor_job(
+            lambda: ccp.discover(timeout=3.0, targets=["255.255.255.255", *hosts])
+        )
+        return {"devices": [d.__dict__ for d in devs]}
+
+    async def _wifi_setup(call: ServiceCall):
+        ssid = call.data["ssid"]
+        password = call.data.get("password", "")
+        bssid = call.data.get("bssid")
+        method = call.data.get("method", "auto")
+        _LOGGER.info("Effe ECC: Wi-Fi provisioning for '%s' (%s), 45-90 s", ssid, method)
+        try:
+            res = await hass.async_add_executor_job(
+                lambda: provision(ssid, password, bssid=bssid, method=method)
+            )
+        except ValueError as err:
+            raise HomeAssistantError(str(err)) from err
+        if res is None:
+            raise HomeAssistantError(
+                "Nessuna risposta dal modulo Wi-Fi: verifica che il led REMOTE "
+                "lampeggi (2 volte CHANGE, poi on/off premuto 5 s) e che la rete "
+                "sia a 2,4 GHz"
+            )
+        # Follow the new address if one of our entries matches the MAC.
+        for coord in hass.data.get(DOMAIN, {}).values():
+            if coord.device.mac and coord.device.mac.upper() == res.mac.upper() \
+                    and coord.host != res.ip:
+                entry = hass.config_entries.async_get_entry(coord.entry_id)
+                if entry is not None:
+                    hass.config_entries.async_update_entry(
+                        entry, data={**entry.data, CONF_HOST: res.ip}
+                    )
+                    hass.async_create_task(hass.config_entries.async_reload(entry.entry_id))
+        return {"method": res.method, "mac": res.mac, "ip": res.ip}
+
+    async def _sync_time(call: ServiceCall) -> None:
+        for coord in list(hass.data.get(DOMAIN, {}).values()):
+            await coord.async_sync_time()
+
+    hass.services.async_register(
+        DOMAIN, SERVICE_DISCOVER, _discover,
+        schema=vol.Schema({vol.Optional("hosts"): vol.All(cv.ensure_list, [cv.string])}),
+        supports_response=SupportsResponse.ONLY,
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_WIFI_SETUP, _wifi_setup,
+        schema=vol.Schema({
+            vol.Required("ssid"): cv.string,
+            vol.Optional("password", default=""): cv.string,
+            vol.Optional("bssid"): cv.string,
+            vol.Optional("method", default="auto"): vol.In(["auto", "esptouch", "smartlink"]),
+        }),
+        supports_response=SupportsResponse.OPTIONAL,
+    )
+    hass.services.async_register(DOMAIN, SERVICE_SYNC_TIME, _sync_time)
+    return True
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    coordinator = SaunaCoordinator(hass, entry.data[CONF_HOST], entry.data[CONF_PORT])
+    coordinator = SaunaCoordinator(hass, entry)
     await coordinator.async_config_entry_first_refresh()
+    await coordinator.async_load_device_info()
+    serial = coordinator.device.serial
+    if serial and entry.unique_id != f"effe_sauna_{serial}" and not any(
+        e.unique_id == f"effe_sauna_{serial}"
+        for e in hass.config_entries.async_entries(DOMAIN)
+    ):
+        # v1.2.x used the IP as unique id: move to the serial, so that a new
+        # IP (another network, DHCP) is recognised as the same sauna.
+        hass.config_entries.async_update_entry(entry, unique_id=f"effe_sauna_{serial}")
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
@@ -82,149 +180,160 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 
 class SaunaCoordinator(DataUpdateCoordinator[SaunaData]):
-    def __init__(self, hass: HomeAssistant, host: str, port: int) -> None:
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         super().__init__(hass, _LOGGER, name=DOMAIN, update_interval=SCAN_INTERVAL)
-        self.host = host
-        self.port = port
+        self.entry_id = entry.entry_id
+        self.host = entry.data[CONF_HOST]
+        self.port = entry.data.get(CONF_PORT, DEFAULT_PORT)
+        self.client = ccp.EccClient(self.host, self.port)
         self.no_data_streak: int = 0
+        self.device = DeviceInfoData()
+        # Serialise TCP access: the controller accepts one client at a time.
+        self._lock = asyncio.Lock()
 
+    # ------------------------------------------------------------------ poll
     async def _async_update_data(self) -> SaunaData:
         try:
-            data = await asyncio.wait_for(
-                self.hass.async_add_executor_job(self._query_status),
-                timeout=4,
-            )
+            async with self._lock:
+                data = await asyncio.wait_for(
+                    self.hass.async_add_executor_job(self._query_status), timeout=4
+                )
             if data.available:
                 self.no_data_streak = 0
             else:
                 self.no_data_streak += 1
             return data
         except asyncio.TimeoutError:
-            # The inner socket work is bounded below this asyncio budget (see
-            # _query_status), so this should not normally fire. If a poll still
-            # overruns (e.g. the Effe app/panel is holding the socket), treat it
-            # as a transient busy device — same policy as ConnectionResetError —
-            # rather than raising UpdateFailed and spamming the log.
+            # The socket work is bounded below this budget; if a poll still
+            # overruns (app/panel holding the socket) keep the last state.
             self.no_data_streak += 1
             return self.data if self.data is not None else SaunaData(available=True)
-        except Exception as err:
+        except Exception as err:  # noqa: BLE001
             self.no_data_streak += 1
-            raise UpdateFailed(f"Communication error: {err}") from err
+            raise UpdateFailed(f"Communication error: {err!r}") from err
+
+    def _keep_last(self, reachable: bool) -> SaunaData:
+        if self.data is not None:
+            return dataclass_replace(self.data, available=True)
+        return SaunaData(available=reachable)
 
     def _query_status(self) -> SaunaData:
+        # Total socket budget (connect 1.5 s + read 1.5 s) stays below the
+        # 4 s asyncio budget, so a busy device gives a caught OSError.
         try:
-            # Keep the total socket budget (connect + read) strictly below the
-            # 4 s asyncio.wait_for budget in _async_update_data, so a slow/busy
-            # device produces a caught OSError (available=False) instead of an
-            # asyncio.TimeoutError that escapes and leaks the executor thread.
-            with socket.create_connection((self.host, self.port), timeout=1.5) as s:
-                s.sendall(CMD_STATUS)
-                raw = b""
-                deadline = time.monotonic() + 1.5
-                try:
-                    while True:
-                        remaining = deadline - time.monotonic()
-                        if remaining <= 0:
-                            break
-                        s.settimeout(remaining)
-                        chunk = s.recv(512)
-                        if not chunk:
-                            break
-                        raw += chunk
-                except socket.timeout:
-                    pass
-
-            _LOGGER.debug("status raw(%d): %s", len(raw), raw.hex())
-
-            # Locate the STATUS frame inside the response; an unsolicited ack
-            # frame may precede it (e.g. after a panel toggle).
-            idx = raw.find(STATUS_MARKER)
-            if idx < 0 or len(raw) < idx + STATUS_FRAME_LEN:
-                # No usable STATUS frame in this response (e.g. the reply was
-                # split across TCP reads) — genuinely keep the last known
-                # state instead of reporting spurious all-off/unavailable.
-                if self.data is not None:
-                    return dataclass_replace(self.data, available=True)
-                return SaunaData(available=True)
-            frame = raw[idx : idx + STATUS_FRAME_LEN]
-
-            byte9 = frame[9]
-            master_on = bool(byte9 & BIT_MASTER)
-            light_on  = bool(byte9 & BIT_LIGHT)
-            heater_raw = frame[11]
-            # byte[20] tracks the setpoint ÷2 but its LSB oscillates (firmware
-            # parity bit), so mask it before dividing.
-            setpoint = (frame[20] & 0xFE) / 2.0
-
-            return SaunaData(
-                available=True,
-                master_on=master_on,
-                light_on=light_on,
-                heater_raw=heater_raw,
-                setpoint=setpoint,
-            )
-
+            raw = self.client.exchange(CMD_STATUS, until_cmd=ccp.CMD_GET_STATE)
         except ConnectionResetError:
-            # Device resets connections when the Effe app holds the socket.
-            # The device is reachable; state is just temporarily unreadable —
-            # keep the last known state instead of reporting spurious all-off.
-            if self.data is not None:
-                return dataclass_replace(self.data, available=True)
-            return SaunaData(available=True)
+            # The device resets connections while the Effe app holds the socket.
+            return self._keep_last(True)
         except OSError:
-            # Connection/timeout failure. Entities stay available (see
-            # NO_DATA_THRESHOLD in switch.py/sensor.py, which is not driven by
-            # SaunaData.available) so keep the last known state here too,
-            # rather than silently reporting spurious all-off.
-            if self.data is not None:
-                return dataclass_replace(self.data, available=True)
-            return SaunaData(available=False)
+            return self._keep_last(False)
 
-    async def async_send_command(self, cmd: bytes) -> bool:
-        # Predict the resulting state and push it optimistically — the next
-        # poll will confirm it from the bitfield within SCAN_INTERVAL.
+        _LOGGER.debug("status raw(%d): %s", len(raw), raw.hex())
+        state = None
+        for frame in ccp.parse_frames(raw):
+            if frame.cmd == ccp.CMD_GET_STATE and len(frame.data) >= 25:
+                if not frame.checksum_ok:
+                    _LOGGER.debug("STATE frame with bad checksum ignored: %s", raw.hex())
+                    continue
+                state = ccp.parse_state(frame.data)
+        if state is None:
+            # Unsolicited ack only, or reply split across reads: keep last state.
+            return self._keep_last(True)
+        return SaunaData(
+            available=True,
+            master_on=state.on,
+            light_on=state.light,
+            ready=state.ready,
+            domotic=state.domotic,
+            panel=state.panel,
+            sauna_flags=state.sauna_flags,
+            heater_raw=state.probe_raw,
+            setpoint=state.target_c,
+        )
+
+    # ------------------------------------------------------------ identity
+    def _read_device_info(self) -> DeviceInfoData:
+        info = DeviceInfoData()
+        try:
+            ident = self.client.get_identity()
+            info.firmware = ident.firmware
+            info.serial = ident.serial
+            info.product_code = ident.product_code
+            info.product_name = ident.product_name
+        except (OSError, ccp.ProtocolError) as err:
+            _LOGGER.debug("GET_IDENTITY failed: %s", err)
+        try:
+            info.wifi_firmware = self.client.get_wifi_firmware()
+        except (OSError, ccp.ProtocolError) as err:
+            _LOGGER.debug("GET_PARAM 28 failed: %s", err)
+        try:
+            mac = self.client.get_param(ccp.PARAM_MAC)
+            if mac and len(mac) >= 7 and mac[0] == ccp.PARAM_MAC:
+                info.mac = ":".join(f"{b:02X}" for b in mac[1:7])
+        except (OSError, ccp.ProtocolError) as err:
+            _LOGGER.debug("GET_PARAM 30 failed: %s", err)
+        return info
+
+    async def async_load_device_info(self) -> None:
+        """Firmware, serial, product code, Wi-Fi module version (once per
+        setup; failures are not fatal, the next reload retries)."""
+        async with self._lock:
+            try:
+                self.device = await asyncio.wait_for(
+                    self.hass.async_add_executor_job(self._read_device_info), timeout=30
+                )
+            except asyncio.TimeoutError:
+                _LOGGER.debug("device info read timed out")
+
+    # ------------------------------------------------------------ commands
+    async def async_switch(self, function: int, on: bool) -> None:
         predicted = None
         if self.data is not None:
-            if cmd == CMD_ON:
-                predicted = dataclass_replace(self.data, master_on=True)
-            elif cmd == CMD_OFF:
-                # Hardware turns off the light together with the master.
-                predicted = dataclass_replace(self.data, master_on=False, light_on=False)
-            elif cmd == CMD_LIGHT_ON:
-                predicted = dataclass_replace(self.data, light_on=True)
-            elif cmd == CMD_LIGHT_OFF:
-                predicted = dataclass_replace(self.data, light_on=False)
-
+            if function == ccp.FUNC_SAUNA:
+                predicted = dataclass_replace(
+                    self.data, master_on=on, **({} if on else {"light_on": False})
+                )
+            elif function == ccp.FUNC_LIGHT:
+                predicted = dataclass_replace(self.data, light_on=on)
         try:
-            await asyncio.wait_for(
-                self.hass.async_add_executor_job(self._send_cmd, cmd),
-                timeout=8,
-            )
-            if predicted is not None:
-                self.async_set_updated_data(predicted)
-            return True
-        except Exception as err:
-            _LOGGER.error("Command send error: %s", err)
-            return False
+            async with self._lock:
+                await asyncio.wait_for(
+                    self.hass.async_add_executor_job(self.client.switch, function, on),
+                    timeout=12,
+                )
+        except ccp.CommandRejected as err:
+            raise HomeAssistantError(
+                "La sauna ha rifiutato il comando: abilita la domotica sul pannello"
+            ) from err
+        except (OSError, ccp.ProtocolError, asyncio.TimeoutError) as err:
+            # The controller sometimes closes the socket right after executing
+            # the command without answering: let the next poll decide.
+            _LOGGER.warning("Effe ECC: command 0x%02X not confirmed: %r", function, err)
+            await self.async_request_refresh()
+            return
+        if predicted is not None:
+            self.async_set_updated_data(predicted)
 
-    def _send_cmd(self, cmd: bytes) -> None:
-        # The device briefly refuses new connections during transitions (e.g.
-        # just after a panel button press, while the internal firmware app
-        # finishes processing). Retry transparently so the user doesn't have
-        # to.
-        last_err: Exception | None = None
-        for attempt in range(4):
-            try:
-                with socket.create_connection((self.host, self.port), timeout=1.5) as s:
-                    s.sendall(cmd)
-                    s.settimeout(0.7)
-                    try:
-                        s.recv(64)  # consume ack if any
-                    except (socket.timeout, ConnectionResetError):
-                        pass  # RST = command processed, timeout = no ack: both are OK
-                return
-            except OSError as err:
-                last_err = err
-                time.sleep(0.35)
-        if last_err is not None:
-            raise last_err
+    async def async_send_command(self, cmd: bytes) -> bool:
+        """v1.2.x API, kept for compatibility."""
+        mapping = {
+            CMD_ON: (ccp.FUNC_SAUNA, True), CMD_OFF: (ccp.FUNC_SAUNA, False),
+            CMD_LIGHT_ON: (ccp.FUNC_LIGHT, True), CMD_LIGHT_OFF: (ccp.FUNC_LIGHT, False),
+        }
+        if cmd not in mapping:
+            return False
+        await self.async_switch(*mapping[cmd])
+        return True
+
+    async def async_sync_time(self) -> None:
+        now = dt_util.now()
+        try:
+            async with self._lock:
+                await asyncio.wait_for(
+                    self.hass.async_add_executor_job(self.client.set_time, now), timeout=8
+                )
+        except ccp.CommandRejected as err:
+            raise HomeAssistantError("La sauna ha rifiutato l'impostazione dell'ora") from err
+        except (OSError, ccp.ProtocolError, asyncio.TimeoutError) as err:
+            raise HomeAssistantError(f"Impossibile impostare l'ora: {err!r}") from err
+        _LOGGER.info("Effe ECC: clock set to %s", now.strftime("%Y-%m-%d %H:%M:%S"))

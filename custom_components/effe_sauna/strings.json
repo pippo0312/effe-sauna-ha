@@ -3,18 +3,79 @@
     "step": {
       "user": {
         "title": "Effe ECC Sauna",
-        "description": "Enter the IP address of your Effe sauna WiFi module (ECC controller). Default port is 8899.",
-        "data": {
-          "host": "IP Address",
-          "port": "TCP Port"
+        "menu_options": {
+          "discover": "Cerca la sauna in rete",
+          "manual": "Inserisci l'indirizzo IP",
+          "wifi": "Collega una sauna al Wi-Fi (prima installazione o cambio rete/password)"
         }
+      },
+      "discover": {
+        "title": "Saune trovate",
+        "data": {"device": "Sauna"}
+      },
+      "manual": {
+        "title": "Configura Effe ECC Sauna",
+        "data": {"host": "Indirizzo IP", "port": "Porta TCP"}
+      },
+      "wifi": {
+        "title": "Collega la sauna al Wi-Fi",
+        "description": "1. Sul pannello: premi 2 volte CHANGE, poi tieni premuto on/off per 5 s finche' il led REMOTE lampeggia (hammam/Logica: tieni premuto on/off 5 s finche' l'icona Casa lampeggia).\n2. Inserisci la rete Wi-Fi a 2,4 GHz e la sua password.\n3. Home Assistant invia i dati per 45 s (EspTouch) e, se non risponde, altri 45 s (SmartLink). Funziona meglio se il router inoltra il multicast verso il Wi-Fi.",
+        "data": {
+          "ssid": "Nome della rete (SSID)",
+          "password": "Password",
+          "bssid": "BSSID del punto di accesso (facoltativo)",
+          "method": "Metodo"
+        },
+        "data_description": {
+          "bssid": "MAC della radio a 2,4 GHz del router piu' vicino alla sauna, es. AA:BB:CC:DD:EE:FF. Vuoto = 00:00:00:00:00:00."
+        }
+      },
+      "reconfigure": {
+        "title": "Cambia indirizzo della sauna",
+        "data": {"host": "Indirizzo IP", "port": "Porta TCP"}
       }
     },
+    "progress": {
+      "provisioning": "Invio della rete Wi-Fi alla sauna (fino a 90 secondi)..."
+    },
     "error": {
-      "cannot_connect": "Cannot connect to the sauna. Check the IP address and port, and make sure the device is powered on and reachable on your network."
+      "cannot_connect": "Impossibile connettersi alla sauna. Verifica IP e porta.",
+      "no_devices": "Nessuna sauna trovata in rete: inserisci l'indirizzo IP.",
+      "no_answer": "La sauna non ha risposto. Controlla che il led REMOTE lampeggi, che la rete sia a 2,4 GHz e la password; riprova."
     },
     "abort": {
-      "already_configured": "This device is already configured."
+      "already_configured": "Questa sauna e' gia' configurata (indirizzo aggiornato).",
+      "reconfigure_successful": "Indirizzo aggiornato."
+    }
+  },
+  "selector": {
+    "method": {
+      "options": {
+        "auto": "Automatico (EspTouch, poi SmartLink)",
+        "esptouch": "Solo EspTouch",
+        "smartlink": "Solo SmartLink"
+      }
+    }
+  },
+  "services": {
+    "discover": {
+      "name": "Cerca saune",
+      "description": "Cerca i moduli Effe ECC in rete (UDP 48899) e restituisce IP, MAC, seriale e firmware.",
+      "fields": {"hosts": {"name": "Indirizzi da interrogare", "description": "IP da interrogare anche direttamente, se il router blocca il broadcast."}}
+    },
+    "wifi_setup": {
+      "name": "Collega la sauna al Wi-Fi",
+      "description": "Invia rete e password al modulo Wi-Fi in modalita' configurazione (led REMOTE lampeggiante). Serve per la prima installazione o per cambiare rete o password.",
+      "fields": {
+        "ssid": {"name": "SSID", "description": "Nome della rete a 2,4 GHz."},
+        "password": {"name": "Password", "description": "Password della rete."},
+        "bssid": {"name": "BSSID", "description": "MAC del punto di accesso (facoltativo)."},
+        "method": {"name": "Metodo", "description": "auto, esptouch o smartlink."}
+      }
+    },
+    "sync_time": {
+      "name": "Sincronizza orologio",
+      "description": "Imposta sulla sauna l'ora di Home Assistant."
     }
   }
 }

@@ -10,130 +10,150 @@ Developed and tested on an **[Effe Sky](https://www.effe.it/prodotto/sky/)** sau
 
 ## ⚠️ Disclaimer
 
-- **Unofficial / unsupported.** This integration is based on a fully reverse-engineered TCP binary protocol. Effe provides no official API or documentation.
+- **Unofficial / unsupported.** The local protocol was worked out from the traffic of the Effe ECC app, from the app itself and from tests on a real sauna. Effe provides no official API or documentation.
 - **No warranty.** Use at your own risk. The author provides no guarantee of correctness, reliability, or compatibility with future firmware versions.
-- **Sauna cabin temperature is NOT exposed by the device.** The only temperature-related value (`Sonda Sauna raw`) is a raw NTC sensor reading, not Celsius. Use an external thermometer (Ruuvi Tag, Bluetooth, etc.) for real cabin temperature.
 - Personal project shared as-is to help other Effe owners. Issues and pull requests welcome, but response time is not guaranteed.
 
 ---
 
-## What's new in v1.2.0
+## What's new in v1.3.0
 
-Major rewrite based on **complete reverse-engineering of the status byte 9 bitfield** (May 2026). Previous releases incorrectly interpreted byte 9 as a Celsius temperature; it is in fact a packed status bitfield.
+- **Connect the sauna to Wi-Fi from Home Assistant**: first setup, or a new network or password. Same method as the app (EspTouch, then SmartLink). See [Wi-Fi setup](#wi-fi-setup).
+- **Search the sauna on the network** (UDP 48899, like the app), and **reconfigure** to change the IP of an existing entry. The entry now uses the controller serial as unique id, so the same sauna on a new IP is recognised.
+- New entities: **Sauna pronta** (ready), **Domotica abilitata** (remote control enabled on the panel), **Temperatura sonda sauna** (°C), **Sincronizza orologio** button, **Firmware modulo Wi-Fi** (diagnostic).
+- Device page shows ECC firmware, serial, product code, Wi-Fi module firmware and MAC.
+- Commands that the controller refuses (domotics disabled on the panel) now raise a clear error instead of failing silently.
+- Proper CCP framing (escaping, checksum, ACK/NACK) in `protocol.py`; one TCP request at a time.
+- `tools/effe_ecc.py`: command line tool, Python standard library only.
 
-### Bugs fixed since v1.1.1
-
-- **Turning on the light from the panel no longer triggers a false "sauna on" state in Home Assistant.** Previous versions read `byte[9] / 2` as temperature: `0x40` (light off) → 32.0°C → master "off", `0x42` (light on) → 33.0°C → master "on". The bitfield-aware decoder fixes this.
-- **Light state from panel toggles is now reflected in HA within one polling cycle (≤5 s)**, not just commands sent from HA. Previous versions tracked light only locally.
-- **Master power state is read directly from the device**, no longer inferred from probe temperature.
-- **Spurious "everything off" reading after panel toggles eliminated.** Frames are now parsed by searching for the STATUS marker (`f7 00 80 28`) rather than a fixed offset — the device sometimes prefixes the response with an ack frame that shifted the bit interpretation.
-- **Failed commands retried transparently.** The device briefly refuses TCP connections during firmware transitions; the integration retries up to 4× with short backoff.
-- **Setpoint sensor is now stable.** Previous versions oscillated between e.g. 91.0 °C and 91.5 °C because the firmware toggles the LSB of byte 20 as a parity bit — now masked.
-
-### Other changes
-
-- Poll interval reduced from 10 s → **5 s** (more responsive UI).
-- Removed `Probe Temperature` entity (was meaningless — value was the byte 9 bitfield divided by 2).
-- Renamed heater temperature sensor to `Sonda Sauna (raw)` with **no unit and no device class**. The raw NTC value is not a linear Celsius reading and earlier releases were misleading.
-- Removed dead code: `RestoreEntity`, custom `_handle_coordinator_update` overrides, `_light_on` local tracking, `_sauna_commanded_on`.
-- Optimistic state push: HA updates the UI immediately on user command, polling confirms within 5 s.
-
-### Breaking changes (migration from v1.1.x)
-
-- Entity `sensor.effe_ecc_sauna_temperatura_sauna` is **removed**. Delete any dashboard cards or automations referencing it.
-- Entity `sensor.effe_ecc_sauna_temperatura_resistenza_sauna` is **replaced** by `sensor.effe_ecc_sauna_sonda_sauna_raw`. The new entity has no unit (raw byte value, not Celsius). Update dashboard cards.
+Full list in [CHANGELOG.md](CHANGELOG.md). Upgrading from v1.2.x needs no change: existing entity ids are kept.
 
 ---
 
 ## Features
 
-### Entities exposed
+### Entities
 
 | Entity | Type | Description |
 |--------|------|-------------|
-| **Sauna** | Switch | Master power ON / OFF. Reflects real device state (panel + HA + app). |
-| **Luce Sauna** | Switch | Internal light. Independent of master power. Reflects real device state. |
-| **Temperatura Impostata Sauna** | Sensor (°C) | Setpoint dial position. |
-| **Sonda Sauna (raw)** | Sensor (no unit) | Raw NTC value from the controller's internal probe. Not Celsius. See [Temperature sensors](#temperature-sensors). |
+| **Sauna** | Switch | Master power ON / OFF. Reflects the real device state (panel + HA + app). |
+| **Luce Sauna** | Switch | Cabin light. Independent of master power. |
+| **Sauna pronta** | Binary sensor | The controller reports that the cabin reached the setpoint (state byte 5, bit 7). |
+| **Temperatura sonda sauna** | Sensor (°C) | The controller's own probe, in °C. Shown only above 40 °C, see [Temperature sensors](#temperature-sensors). |
+| **Temperatura Impostata Sauna** | Sensor (°C) | Setpoint. |
+| **Sonda Sauna (raw)** | Sensor | Raw byte of the probe (half degrees). |
+| **Domotica abilitata** | Binary sensor (diagnostic) | Remote control enabled on the panel. When off, the controller refuses every command. |
+| **Firmware modulo Wi-Fi** | Sensor (diagnostic) | Wi-Fi module firmware; attributes: ECC firmware, serial, product code, MAC. |
+| **Sincronizza orologio** | Button | Sets the Home Assistant time on the controller, as the app does. |
 
-### Not implemented (not present on the tested Effe Sky model)
+### Services
 
-- Mood lighting
-- Chromotherapy (colour therapy)
-- RGB light control
-- Multiple heating zones
-- Audio (if equipped)
+| Service | What it does |
+|---------|--------------|
+| `effe_sauna.discover` | Searches Effe ECC modules on the network and returns IP, MAC, serial, firmware. Optional `hosts` to query directly if your router drops broadcasts. |
+| `effe_sauna.wifi_setup` | Sends network and password to a module in configuration mode. Returns the MAC and the new IP; an existing entry for the same sauna follows the new IP. |
+| `effe_sauna.sync_time` | Same as the button, for every configured sauna. |
 
-If you own a model with these features and want to contribute protocol bytes (capture with `tcpdump`/Wireshark while toggling from the Android app), please open an issue.
+### Not implemented
+
+The protocol also has commands for chromotherapy, mood light, infrared, steam and warm power (hammam). They are available in `tools/effe_ecc.py`, but they are not entities because the tested sauna does not have them. If you own such a model and can test them, please open an issue.
 
 ---
 
-## Protocol notes
+## Wi-Fi setup
 
-The device communicates over **TCP port 8899** with a proprietary binary protocol (Espressif/ESP32 chipset). The protocol was reverse-engineered by:
-- Capturing the local TCP traffic between the Effe ECC Android app and the device.
-- Probing the controller directly with handcrafted frames while observing state changes from the physical panel.
+Works for the first setup and to move the sauna to another network or password.
 
-There is no official documentation.
+1. Put the module in configuration mode. Sauna: press **CHANGE** twice, then hold **on/off** for 5 s until the **REMOTE** led blinks. Hammam / Logica: hold on/off for 5 s until the House icon blinks.
+2. In Home Assistant: **Settings → Devices & Services → Add Integration → Effe ECC Sauna → Connect a sauna to Wi-Fi**, or call the service `effe_sauna.wifi_setup`.
+3. Enter the **2.4 GHz** network name and password. The BSSID (MAC of the access point nearest to the sauna) is optional.
 
-### CMD_STATUS response — byte map
+Home Assistant then sends the data for 45 s with **EspTouch** and, if nothing answers, 45 s more with **SmartLink**. The module answers with its MAC and its new IP.
 
-The device responds to `CMD_STATUS` with a **41-byte frame** (sometimes prefixed by an unsolicited 7-byte ack frame after a state change). The frame is anchored by the marker `f7 00 80 28`.
+Notes:
 
-| Byte | Meaning |
-|------|---------|
-| 0–3  | Frame header + opcode echo (`f7 00 80 28`) |
-| **9** | **Status bitfield** (see below) |
-| 11   | Raw NTC sensor value (exposed as `Sonda Sauna raw`) |
-| 20   | Setpoint × 2 (LSB is parity, mask with `0xFE`) |
-| 40   | Frame checksum |
-| —    | Other bytes constant in observed states (unknown meaning) |
-
-### Byte 9 bitfield (the key finding)
-
-| Bit | Mask | Meaning |
-|-----|------|---------|
-| 0   | `0x01` | Master power ON |
-| 1   | `0x02` | Light ON |
-| 6   | `0x40` | Lifesign (always 1 when controller responding) |
-| 2–5, 7 | — | Unknown (always 0 in all observed states) |
-
-Examples:
-- `0x40` → all off (master off, light off, controller alive)
-- `0x41` → master on, light off
-- `0x42` → master off, light on
-- `0x43` → master on, light on
-
-Verified with 10 physical panel toggles, 100% deterministic.
-
-### Known commands
-
-| Command | Hex | Notes |
-|---------|-----|-------|
-| STATUS    | `f7 7d 00 28 fb a5` | Query state |
-| ON        | `f7 7d 00 37 fd fe fe fb af` | Master on |
-| OFF       | `f7 7d 00 36 fd fe fe fb ae` | Master off |
-| LIGHT ON  | `f7 7d 00 37 fd fc fb ad` | Light on |
-| LIGHT OFF | `f7 7d 00 36 fd fc fb ac` | Light off |
-
-Checksum rule (last byte): `opcode + body_constant`. For STATUS: `0x28 + 0x7d = 0xa5`. For master commands: `opcode + 0x78`. For light commands: `opcode + 0x76`.
-
-### Connection behaviour
-
-- The device accepts only **one TCP connection at a time**. While the Effe Android app is connected, polling from HA will fail with `OSError` until the app disconnects.
-- When the master power is off, the device sometimes **resets new connections** (RST) before completing the handshake — but it still serves status correctly once master is on.
-- The device may briefly refuse connections immediately after a state change (panel toggle); the integration retries automatically.
+- The data travel as UDP multicast from Home Assistant to the router, which has to pass them on over Wi-Fi. Some mesh systems filter multicast towards wireless clients; if Home Assistant (often on a cable) gets no answer, run the same procedure from a computer on the Wi-Fi: `python3 tools/effe_ecc.py wifi --ssid MyNet --password secret`.
+- The module only supports 2.4 GHz networks. There is no command to choose the Wi-Fi channel: the module uses the router's channel.
+- The module's own access point (`effegibi-XXXXXXXX`) is not used by this procedure.
 
 ---
 
 ## Temperature sensors
 
-> The Effe controller does **not** expose actual cabin air temperature on this protocol. The only varying sensor (byte 11) is a raw NTC value, not a linear Celsius reading. For real cabin temperature, place an external sensor inside the sauna ([Ruuvi Tag](https://ruuvi.com/) or any Bluetooth thermometer supported by Home Assistant).
-
 | Sensor | Source | Behaviour |
 |--------|--------|-----------|
-| **Sonda Sauna (raw)** | `byte[11]` | Raw NTC value 0–255 (no unit). Roughly: 14 = cold idle, ~92 = warming, 200+ = hot. Non-linear with actual temperature. Useful as a qualitative indicator that the heating element is active. |
-| **Temperatura Impostata Sauna** | `(byte[20] & 0xFE) / 2.0` | Stable, accurate. Reflects the physical dial position. |
+| **Temperatura sonda sauna** | state byte 7 / 2 | The probe the controller regulates on, in the same half-degree scale as the setpoint: while heating it settles on the setpoint (raw 183-191 with setpoint 186 = 93 °C). It sits near the ceiling, so it reads higher than the cabin air at bench height. Below about 40 °C it reads far too low (raw 5 with the cabin at 21 °C), so the sensor is unknown below 40 °C. |
+| **Sonda Sauna (raw)** | state byte 7 | The same value, unscaled. |
+| **Temperatura Impostata Sauna** | `(state byte 16 & 0xFE) / 2` | Setpoint; the lowest bit toggles on its own and is masked. |
+
+For the cabin air temperature use an external sensor ([Ruuvi Tag](https://ruuvi.com/) or any Bluetooth thermometer supported by Home Assistant).
+
+---
+
+## Protocol notes
+
+The ECC controller sits behind an Espressif Wi-Fi module that passes bytes between TCP and the controller's serial line.
+
+| | |
+|---|---|
+| Discovery | UDP **48899**, send `HF-A11ASSISTHREAD`; reply `IP,MAC,<20 chars>` (serial, firmware, product, hardware) |
+| Control | TCP **8899**, no authentication, **one client at a time** |
+| Frame | `F7 SRC DST CMD DATA… FB CHK`; app = `0x7D`, controller = `0x00` |
+| Escape | every DATA byte equal to `F7`, `FB` or `FE` is preceded by `FE` |
+| Checksum | `(SRC + DST + CMD + sum of unescaped DATA) mod 256`, not escaped |
+| Replies | `CMD & 0x7F`; DATA `EF` = ACK, `FF` = NACK (refused) |
+
+### Commands
+
+| CMD | Name | DATA |
+|-----|------|------|
+| `0x28` | GET_STATE | — |
+| `0x72` | GET_IDENTITY | — (reply: firmware, serial, product bitmap) |
+| `0x37` / `0x36` | ON / OFF | target, function: sauna `FD FE`, light `FD FC`, chromo `FD FB`, mood `FD EB`, IR `FD EA`; hammam target `FE` |
+| `0x3B` | RECALL_SCENE | target, colour 1-9 |
+| `0x10` | SETPOINT_UPDATE | hammam power: `FE FF 84/88/92` (steam), `FE FD 46/58/70` (warm) |
+| `0x39` | SET_SYS_TIME | year-2000, month, day, hour, minute, second |
+| `0x50` | GET_PARAM | parameter number (28 = Wi-Fi module firmware, 30 = MAC) |
+
+### GET_STATE reply (DATA bytes)
+
+| Byte | Meaning |
+|------|---------|
+| 0 | hammam flags |
+| 5 | sauna flags: bit 0 on, 1 light, 2 chromo, 3 biosauna, 4 mood, 5 IR, 6 panel, 7 ready |
+| 7 | sauna probe (half degrees) |
+| 16 | sauna setpoint (half degrees, LSB masked) |
+| 17 / 18 | hammam / sauna colour |
+| 24 | bit 1 = domotics (remote control) enabled |
+
+Byte numbers count from the first DATA byte. Versions up to 1.2.x counted from the start of the frame (+4: byte 9, 11, 20).
+
+The reply to GET_STATE is followed by an unsolicited `0x34` frame (`01 ff ff ff 00 ff` on the tested sauna); after a panel action an ACK frame can come first.
+
+### Connection behaviour
+
+- The controller accepts only **one TCP connection at a time**. While the Effe app is connected, Home Assistant polls fail; the integration keeps the last known state for up to 10 minutes.
+- Right after a state change the device may refuse connections or reset them; requests are retried.
+
+---
+
+## Command line tool
+
+`tools/effe_ecc.py` needs only Python 3 (no Home Assistant):
+
+```
+effe_ecc.py discover [--host 192.168.1.50]
+effe_ecc.py state 192.168.1.50 [--json]
+effe_ecc.py info 192.168.1.50
+effe_ecc.py on|off 192.168.1.50 sauna|sauna_light|…
+effe_ecc.py scene 192.168.1.50 sauna 3
+effe_ecc.py power 192.168.1.50 steam med
+effe_ecc.py settime 192.168.1.50
+effe_ecc.py raw 192.168.1.50 0x50 1c
+effe_ecc.py wifi --ssid MyNet --password secret
+```
+
+Tests of the protocol code: `python3 tests/test_protocol.py`.
 
 ---
 
@@ -141,7 +161,7 @@ Checksum rule (last byte): `opcode + body_constant`. For STATUS: `0x28 + 0x7d = 
 
 - Effe sauna with ECC WiFi module
 - Compatible with the [Effe ECC Android app](https://play.google.com/store/apps/details?id=com.effegibi.effeecc)
-- Device reachable on your local network (same subnet as Home Assistant, or properly routed)
+- Device reachable on your local network, domotics (remote control) enabled on the panel
 - Default TCP port: **8899**
 
 ---
@@ -165,26 +185,23 @@ Checksum rule (last byte): `opcode + body_constant`. For STATUS: `0x28 + 0x7d = 
 
 ## Configuration
 
-1. **Settings → Devices & Services → Add Integration**
-2. Search for **Effe ECC Sauna**
-3. Enter the device **IP address** (find it in your router's DHCP table or the Effe ECC app) and **port** (default: 8899)
+**Settings → Devices & Services → Add Integration → Effe ECC Sauna**, then:
 
-The integration tests connectivity before saving. Assign a static IP to the device in your router for reliable operation.
+- **Search the sauna on the network**: lists the saunas that answer the UDP search;
+- **Enter the IP address**: IP and port (default 8899);
+- **Connect a sauna to Wi-Fi**: see [Wi-Fi setup](#wi-fi-setup).
 
-To reload the integration without a full HA restart:
-**Settings → Devices & Services → Effe ECC Sauna → ⋮ → Reload**
+To change the IP later: **Effe ECC Sauna → ⋮ → Reconfigure**. Assigning a static IP (DHCP reservation) to the module is still recommended.
 
 ---
 
 ## Tested hardware
 
-- **Effe Sky** sauna — 3-phase, ~7.6 kW (3 × ~2.5 kW elements), ECC Module 2.0 ESP WiFi controller, firmware version reported by the device unknown.
+- **Effe Sky** sauna — 3-phase, ~7.6 kW, ECC firmware 3.6.0623 (product code 16), Wi-Fi module firmware V1.1.04-3004-06.
 
 ---
 
 ## Debugging
-
-Enable debug logging in `configuration.yaml`:
 
 ```yaml
 logger:
@@ -199,15 +216,6 @@ You will see the raw STATUS hex of every poll, useful for reporting protocol dif
 
 ## Contributing
 
-- Found this working on another Effe model? Open an issue describing the model and any byte differences observed.
-- Reverse-engineered the mood/chromo/RGB/audio protocol bytes? Pull requests very welcome.
+- Found this working on another Effe model? Open an issue with the output of `tools/effe_ecc.py info <ip>` and `state <ip> --json`.
+- Tested chromotherapy, mood, IR or hammam commands? Pull requests very welcome.
 - Found a bug? Open an issue with your HA version and the relevant log lines.
-
----
-
-## Acknowledgements
-
-The v1.2.0 protocol rewrite is the result of a focused reverse-engineering session combining:
-- Active probing of the controller with crafted frames
-- Cross-correlation of byte differences with physical state changes (panel toggles)
-- Pcap captures of the device's spontaneous broadcast / multicast traffic (none found — the device only speaks unicast on TCP 8899)

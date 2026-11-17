@@ -1,0 +1,29 @@
+discover:
+  fields:
+    hosts:
+      example: "192.168.1.50"
+      selector:
+        text:
+          multiple: true
+
+wifi_setup:
+  fields:
+    ssid:
+      required: true
+      selector:
+        text:
+    password:
+      selector:
+        text:
+          type: password
+    bssid:
+      example: "AA:BB:CC:DD:EE:FF"
+      selector:
+        text:
+    method:
+      default: auto
+      selector:
+        select:
+          options: ["auto", "esptouch", "smartlink"]
+
+sync_time:
